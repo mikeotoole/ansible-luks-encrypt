@@ -4,6 +4,7 @@
 # Builds a bootable USB drive used to encrypt the internal disk.
 #
 # Usage:
+#   ansible-playbook prepare-usb.yml --ask-become-pass
 #   ansible-playbook prepare-usb.yml -e usb_device=/dev/sda --ask-become-pass
 #
 # Reference: https://davidalger.com/posts/fedora-asahi-remix-on-apple-silicon-with-luks-encryption/
@@ -14,42 +15,81 @@
   gather_facts: false
 
   tasks:
-    # --- Identify and validate USB device ---
-    - name: Validate USB device is set
-      ansible.builtin.assert:
-        that:
-          - usb_device is defined
-          - usb_device | length > 0
-        fail_msg: >
-          Set usb_device: ansible-playbook prepare-usb.yml -e usb_device=/dev/sda --ask-become-pass
+    # --- Detect USB device ---
+    - name: Scan for USB block devices
+      ansible.builtin.shell:
+        cmd: "lsblk -d -n -p -o NAME,SIZE,MODEL,TRAN | grep ' usb$'"
+      register: usb_scan
+      changed_when: false
+      failed_when: false
+      when: usb_device is not defined
 
     - name: List all block devices
       ansible.builtin.shell:
-        cmd: "lsblk -d -o NAME,SIZE,MODEL,TRAN -n -p"
+        cmd: "lsblk -d -p -o NAME,SIZE,MODEL,TRAN"
       register: all_devices
       changed_when: false
 
-    - name: Show available devices
-      ansible.builtin.debug:
+    - name: Fail if no USB devices found
+      ansible.builtin.fail:
         msg: |
+          No USB devices detected. Plug in your USB drive and try again.
 
-          All block devices:
-          NAME             SIZE MODEL                    TRAN
           {{ all_devices.stdout }}
+      when:
+        - usb_device is not defined
+        - usb_scan.stdout_lines | default([]) | length == 0
 
-          Selected: {{ usb_device }}
+    - name: Auto-select single USB device
+      ansible.builtin.set_fact:
+        usb_device: "{{ usb_scan.stdout_lines[0].split()[0] }}"
+      when:
+        - usb_device is not defined
+        - usb_scan.stdout_lines | length == 1
 
-    - name: Verify USB device exists
+    - name: Show auto-detected device
+      ansible.builtin.debug:
+        msg: "Auto-detected USB device: {{ usb_scan.stdout_lines[0] }}"
+      when:
+        - usb_scan is not skipped
+        - usb_scan.stdout_lines | default([]) | length == 1
+
+    - name: Prompt to choose from multiple USB devices
+      ansible.builtin.pause:
+        prompt: |
+
+          Multiple USB devices found:
+          {{ usb_scan.stdout }}
+
+          Enter the device path to use (e.g., /dev/sda)
+      register: multi_usb_choice
+      when:
+        - usb_device is not defined
+        - usb_scan.stdout_lines | length > 1
+
+    - name: Set chosen USB device
+      ansible.builtin.set_fact:
+        usb_device: "{{ multi_usb_choice.user_input | trim }}"
+      when:
+        - multi_usb_choice is not skipped
+        - multi_usb_choice.user_input is defined
+
+    - name: Fail if no device selected
+      ansible.builtin.fail:
+        msg: "No USB device selected. Pass -e usb_device=/dev/sda or plug in a USB drive."
+      when: usb_device is not defined or usb_device | length == 0
+
+    # --- Validate selected device ---
+    - name: Verify device exists
       ansible.builtin.stat:
         path: "{{ usb_device }}"
       register: usb_check
 
-    - name: Fail if USB device not found
+    - name: Fail if device not found
       ansible.builtin.fail:
         msg: |
-          {{ usb_device }} not found. Plug in your USB drive and try again.
+          {{ usb_device }} not found. Check the path and try again.
 
-          Available devices:
           {{ all_devices.stdout }}
       when: not usb_check.stat.exists
 
@@ -93,6 +133,7 @@
         device_size.stdout | trim | regex_search('[0-9.]+') | float > 256
         and 'T' in device_size.stdout
 
+    # --- Confirm before erasing ---
     - name: Get device details for confirmation
       ansible.builtin.shell:
         cmd: "lsblk -o NAME,SIZE,FSTYPE,LABEL,MOUNTPOINTS {{ usb_device }}"

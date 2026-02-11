@@ -51,10 +51,19 @@ It also shows the device details and requires you to type `yes` before erasing.
 
 ```bash
 cd /home/mikeo/Development/ansible-luks-encrypt
-ansible-playbook prepare-usb.yml -e usb_device=/dev/sda --ask-become-pass
+ansible-playbook prepare-usb.yml --ask-become-pass
 ```
 
-Replace `/dev/sda` with your actual USB device.
+The playbook will auto-detect your USB device:
+- **One USB device found** — auto-selected, shown for confirmation
+- **Multiple USB devices** — prompts you to pick one
+- **No USB devices** — fails with a list of all block devices
+
+You can also specify the device explicitly to skip detection:
+
+```bash
+ansible-playbook prepare-usb.yml -e usb_device=/dev/sda --ask-become-pass
+```
 
 The playbook will:
 - Install build dependencies
@@ -178,7 +187,7 @@ Pass at runtime:
 
 | Variable | Example | Description |
 |----------|---------|-------------|
-| `usb_device` | `/dev/sda` | USB device path (required for prepare-usb) |
+| `usb_device` | _(auto-detected)_ | USB device path (auto-detected if not set) |
 | `root_partition` | `/dev/nvme0n1p6` | Override auto-detected LUKS partition |
 
 ## Warnings

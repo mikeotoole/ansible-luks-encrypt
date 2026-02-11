@@ -1,0 +1,18 @@
+# Path to cloned asahi-fedora-usb repository
+asahi_usb_repo_path: /home/mikeo/Development/asahi-fedora-usb
+asahi_usb_repo_url: https://github.com/leifliddy/asahi-fedora-usb.git
+
+# USB device for recovery drive (pass with -e usb_device=/dev/sda)
+# usb_device: /dev/sda
+
+# Internal NVMe device
+nvme_device: /dev/nvme0n1
+
+# LUKS device mapper name
+luks_name: fedora-root
+
+# Chroot mount point (used from USB boot)
+chroot_mount: /mnt
+
+# This project directory (for copying to USB)
+project_dir: /home/mikeo/Development/ansible-luks-encrypt

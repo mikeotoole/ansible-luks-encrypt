@@ -1,0 +1,189 @@
+---
+# Configure Boot for LUKS-Encrypted Root Partition
+#
+# Run from USB boot AFTER encrypting the root partition.
+#
+# Prerequisites (do these manually before running this playbook):
+#   cryptsetup reencrypt --encrypt --reduce-device-size 32M /dev/nvme0n1pX
+#   cryptsetup open /dev/nvme0n1pX fedora-root
+#
+# Usage:
+#   ansible-playbook setup-encrypted-boot.yml
+#   ansible-playbook setup-encrypted-boot.yml -e root_partition=/dev/nvme0n1p6
+
+- name: Configure encrypted boot
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    luks_name: fedora-root
+    chroot_mount: /mnt
+    nvme_device: /dev/nvme0n1
+
+  tasks:
+    # --- Detect LUKS partition ---
+    - name: Detect LUKS partition on internal drive
+      ansible.builtin.shell:
+        cmd: "blkid -t TYPE=crypto_LUKS -o device {{ nvme_device }}* 2>/dev/null | head -1"
+      register: detected_luks
+      changed_when: false
+      failed_when: false
+      when: root_partition is not defined or root_partition | length == 0
+
+    - name: Set root partition fact
+      ansible.builtin.set_fact:
+        root_partition: "{{ detected_luks.stdout | trim }}"
+      when: root_partition is not defined or root_partition | length == 0
+
+    - name: Fail if no LUKS partition found
+      ansible.builtin.fail:
+        msg: |
+          No LUKS partition found on {{ nvme_device }}.
+
+          Either encrypt first:
+            cryptsetup reencrypt --encrypt --reduce-device-size 32M /dev/nvme0n1pX
+
+          Or specify manually:
+            ansible-playbook setup-encrypted-boot.yml -e root_partition=/dev/nvme0n1p6
+      when: root_partition | default('') | length == 0
+
+    - name: Show detected LUKS partition
+      ansible.builtin.debug:
+        msg: "LUKS partition: {{ root_partition }}"
+
+    # --- Verify LUKS is open ---
+    - name: Check LUKS mapper device exists
+      ansible.builtin.stat:
+        path: "/dev/mapper/{{ luks_name }}"
+      register: luks_mapper
+
+    - name: Fail if LUKS partition is not open
+      ansible.builtin.fail:
+        msg: |
+          /dev/mapper/{{ luks_name }} not found.
+
+          Open it first:
+            cryptsetup open {{ root_partition }} {{ luks_name }}
+
+          Then re-run this playbook.
+      when: not luks_mapper.stat.exists
+
+    # --- Mount filesystems ---
+    - name: Mount root subvolume
+      ansible.builtin.command:
+        cmd: "mount -o subvol=root /dev/mapper/{{ luks_name }} {{ chroot_mount }}"
+
+    - name: Mount home subvolume
+      ansible.builtin.command:
+        cmd: "mount -o subvol=home /dev/mapper/{{ luks_name }} {{ chroot_mount }}/home"
+
+    - name: Get boot partition from fstab
+      ansible.builtin.shell:
+        cmd: "awk '$2 == \"/boot\" && !/^#/ {print $1}' {{ chroot_mount }}/etc/fstab"
+      register: boot_source
+      changed_when: false
+
+    - name: Get EFI partition from fstab
+      ansible.builtin.shell:
+        cmd: "awk '$2 == \"/boot/efi\" && !/^#/ {print $1}' {{ chroot_mount }}/etc/fstab"
+      register: efi_source
+      changed_when: false
+
+    - name: Mount boot partition
+      ansible.builtin.command:
+        cmd: "mount {{ boot_source.stdout | trim }} {{ chroot_mount }}/boot"
+
+    - name: Mount EFI partition
+      ansible.builtin.command:
+        cmd: "mount {{ efi_source.stdout | trim }} {{ chroot_mount }}/boot/efi"
+
+    - name: Show partition layout
+      ansible.builtin.debug:
+        msg:
+          - "Root (LUKS): {{ root_partition }} -> /dev/mapper/{{ luks_name }} -> {{ chroot_mount }}"
+          - "Boot: {{ boot_source.stdout | trim }} -> {{ chroot_mount }}/boot"
+          - "EFI:  {{ efi_source.stdout | trim }} -> {{ chroot_mount }}/boot/efi"
+
+    # --- Get LUKS UUID ---
+    - name: Get LUKS UUID
+      ansible.builtin.command:
+        cmd: "cryptsetup luksUUID {{ root_partition }}"
+      register: luks_uuid_cmd
+      changed_when: false
+
+    - name: Set LUKS UUID fact
+      ansible.builtin.set_fact:
+        luks_uuid: "{{ luks_uuid_cmd.stdout | trim }}"
+
+    - name: Show LUKS UUID
+      ansible.builtin.debug:
+        msg: "LUKS UUID: {{ luks_uuid }}"
+
+    # --- Configure crypttab ---
+    - name: Write /etc/crypttab
+      ansible.builtin.copy:
+        content: "{{ luks_name }} UUID={{ luks_uuid }} none\n"
+        dest: "{{ chroot_mount }}/etc/crypttab"
+        mode: "0600"
+
+    # --- Update GRUB ---
+    - name: Check if GRUB already has LUKS UUID
+      ansible.builtin.command:
+        cmd: "grep -q 'rd.luks.uuid={{ luks_uuid }}' {{ chroot_mount }}/etc/default/grub"
+      register: grub_has_luks
+      changed_when: false
+      failed_when: false
+
+    - name: Add LUKS UUID to GRUB cmdline
+      ansible.builtin.lineinfile:
+        path: "{{ chroot_mount }}/etc/default/grub"
+        regexp: '^(GRUB_CMDLINE_LINUX_DEFAULT=".*)(")'
+        line: '\1 rd.luks.uuid={{ luks_uuid }}\2'
+        backrefs: true
+      when: grub_has_luks.rc != 0
+
+    # --- Rebuild boot configuration ---
+    - name: Regenerate GRUB configuration
+      ansible.builtin.command:
+        cmd: "arch-chroot {{ chroot_mount }} grub2-mkconfig -o /boot/grub2/grub.cfg"
+      changed_when: true
+
+    - name: Rebuild initramfs with dracut
+      ansible.builtin.command:
+        cmd: "arch-chroot {{ chroot_mount }} dracut -f"
+      changed_when: true
+
+    # --- Unmount ---
+    - name: Unmount EFI
+      ansible.builtin.command:
+        cmd: "umount {{ chroot_mount }}/boot/efi"
+
+    - name: Unmount boot
+      ansible.builtin.command:
+        cmd: "umount {{ chroot_mount }}/boot"
+
+    - name: Unmount home
+      ansible.builtin.command:
+        cmd: "umount {{ chroot_mount }}/home"
+
+    - name: Unmount root
+      ansible.builtin.command:
+        cmd: "umount {{ chroot_mount }}"
+
+    # --- Done ---
+    - name: Display completion message
+      ansible.builtin.debug:
+        msg: |
+
+          ================================================================
+           ENCRYPTED BOOT CONFIGURED SUCCESSFULLY
+          ================================================================
+
+          Reboot now:
+            reboot
+
+          At boot you will be prompted for your LUKS passphrase.
+          Characters appear as *** as you type.
+
+          ================================================================

@@ -1,0 +1,237 @@
+---
+# Prepare USB Recovery Drive for Fedora Asahi LUKS Encryption
+#
+# Builds a bootable USB drive used to encrypt the internal disk.
+#
+# Usage:
+#   ansible-playbook prepare-usb.yml -e usb_device=/dev/sda --ask-become-pass
+#
+# Reference: https://davidalger.com/posts/fedora-asahi-remix-on-apple-silicon-with-luks-encryption/
+
+- name: Prepare USB recovery drive
+  hosts: localhost
+  become: true
+  gather_facts: false
+
+  tasks:
+    # --- Identify and validate USB device ---
+    - name: Validate USB device is set
+      ansible.builtin.assert:
+        that:
+          - usb_device is defined
+          - usb_device | length > 0
+        fail_msg: >
+          Set usb_device: ansible-playbook prepare-usb.yml -e usb_device=/dev/sda --ask-become-pass
+
+    - name: List all block devices
+      ansible.builtin.shell:
+        cmd: "lsblk -d -o NAME,SIZE,MODEL,TRAN -n -p"
+      register: all_devices
+      changed_when: false
+
+    - name: Show available devices
+      ansible.builtin.debug:
+        msg: |
+
+          All block devices:
+          NAME             SIZE MODEL                    TRAN
+          {{ all_devices.stdout }}
+
+          Selected: {{ usb_device }}
+
+    - name: Verify USB device exists
+      ansible.builtin.stat:
+        path: "{{ usb_device }}"
+      register: usb_check
+
+    - name: Fail if USB device not found
+      ansible.builtin.fail:
+        msg: |
+          {{ usb_device }} not found. Plug in your USB drive and try again.
+
+          Available devices:
+          {{ all_devices.stdout }}
+      when: not usb_check.stat.exists
+
+    - name: Reject NVMe devices (internal drive)
+      ansible.builtin.fail:
+        msg: |
+          ABORTED: {{ usb_device }} is an NVMe device — that is your internal drive!
+          Specify a USB device instead (e.g., /dev/sda).
+      when: "'nvme' in usb_device"
+
+    - name: Get device transport type
+      ansible.builtin.shell:
+        cmd: "lsblk -d -n -o TRAN {{ usb_device }} 2>/dev/null"
+      register: device_tran
+      changed_when: false
+      failed_when: false
+
+    - name: Reject non-USB transport devices
+      ansible.builtin.fail:
+        msg: |
+          ABORTED: {{ usb_device }} transport is '{{ device_tran.stdout | trim }}', not 'usb'.
+          This does not appear to be a USB device.
+
+          USB devices detected:
+          {{ all_devices.stdout_lines | select('search', 'usb') | list | join('\n') | default('(none found)') }}
+      when: device_tran.stdout | trim != 'usb'
+
+    - name: Get device size
+      ansible.builtin.shell:
+        cmd: "lsblk -d -n -o SIZE {{ usb_device }}"
+      register: device_size
+      changed_when: false
+
+    - name: Reject suspiciously large devices (over 256GB)
+      ansible.builtin.fail:
+        msg: |
+          ABORTED: {{ usb_device }} is {{ device_size.stdout | trim }}.
+          This seems too large for a USB drive and may be an internal disk.
+          If this really is your USB drive, reduce this check in the playbook.
+      when: >
+        device_size.stdout | trim | regex_search('[0-9.]+') | float > 256
+        and 'T' in device_size.stdout
+
+    - name: Get device details for confirmation
+      ansible.builtin.shell:
+        cmd: "lsblk -o NAME,SIZE,FSTYPE,LABEL,MOUNTPOINTS {{ usb_device }}"
+      register: device_info
+      changed_when: false
+
+    - name: Confirm device — ALL DATA WILL BE ERASED
+      ansible.builtin.pause:
+        prompt: |
+
+          ================================================================
+           WARNING: ALL DATA ON THIS DEVICE WILL BE ERASED
+          ================================================================
+
+          {{ device_info.stdout }}
+
+          Type 'yes' to continue, anything else to abort
+      register: user_confirm
+
+    - name: Abort if not confirmed
+      ansible.builtin.fail:
+        msg: "Aborted. No changes were made."
+      when: user_confirm.user_input | lower != 'yes'
+
+    # --- Install build dependencies ---
+    - name: Install USB build dependencies
+      ansible.builtin.dnf:
+        name:
+          - arch-install-scripts
+          - bubblewrap
+          - dosfstools
+          - e2fsprogs
+          - gdisk
+          - git
+          - mkosi
+          - openssl
+          - pandoc
+          - rsync
+          - systemd-container
+        state: present
+
+    # --- Clone repo if needed ---
+    - name: Check if asahi-fedora-usb repo exists
+      ansible.builtin.stat:
+        path: "{{ asahi_usb_repo_path }}/.git"
+      register: repo_check
+
+    - name: Clone asahi-fedora-usb repository
+      ansible.builtin.git:
+        repo: "{{ asahi_usb_repo_url }}"
+        dest: "{{ asahi_usb_repo_path }}"
+      become: false
+      when: not repo_check.stat.exists
+
+    # --- Build USB drive ---
+    - name: Build USB recovery drive (this will take 15-30 minutes)
+      ansible.builtin.shell:
+        cmd: "env -u SUDO_USER ./build.sh -d {{ usb_device }}"
+        chdir: "{{ asahi_usb_repo_path }}"
+      changed_when: true
+
+    # --- Post-build: install ansible and copy playbook to USB ---
+    - name: Mount USB drive for post-install setup
+      ansible.builtin.shell:
+        cmd: "env -u SUDO_USER ./build.sh mount"
+        chdir: "{{ asahi_usb_repo_path }}"
+      changed_when: true
+
+    - name: Install ansible-core on USB image
+      ansible.builtin.command:
+        cmd: "arch-chroot {{ asahi_usb_repo_path }}/mnt_usb dnf install -y ansible-core"
+      changed_when: true
+
+    - name: Copy encryption playbook to USB image
+      ansible.builtin.shell:
+        cmd: >
+          rsync -a --exclude '.git' --exclude '*.retry'
+          {{ project_dir }}/
+          {{ asahi_usb_repo_path }}/mnt_usb/root/ansible-luks-encrypt/
+      changed_when: true
+
+    - name: Unmount USB drive
+      ansible.builtin.shell:
+        cmd: "env -u SUDO_USER ./build.sh umount"
+        chdir: "{{ asahi_usb_repo_path }}"
+      changed_when: true
+
+    # --- Add USB boot entry to GRUB menu ---
+    - name: Add USB boot entry to internal GRUB menu
+      ansible.builtin.command:
+        cmd: "grub2-mkconfig -o /boot/grub2/grub.cfg"
+      changed_when: true
+
+    # --- Next steps ---
+    - name: Display next steps
+      ansible.builtin.debug:
+        msg: |
+
+          ================================================================
+           USB RECOVERY DRIVE READY
+          ================================================================
+
+          A USB boot entry has been added to your GRUB menu.
+
+          NEXT STEPS:
+
+          1. REBOOT and select the USB entry from the GRUB menu:
+             - The USB entry will appear as a /dev/sda partition
+             - Select it instead of the default Fedora entry
+             - Login as: root / fedora
+
+             If the GRUB menu is not visible, hold SHIFT during boot.
+
+             Alternative (U-Boot method):
+             - Reboot and press a key during the U-Boot countdown
+             - At the => prompt type:
+                 env set boot_efi_bootmgr
+                 run usb_boot
+
+          2. CONNECT TO WIFI (if needed):
+             nmcli dev wifi connect YOUR_SSID password YOUR_PASSWORD
+
+          3. IDENTIFY your root partition:
+             lsblk -f /dev/nvme0n1
+             Look for the btrfs partition (likely /dev/nvme0n1p6)
+
+          4. ENCRYPT the root partition (replace p6 if different):
+             mount /dev/nvme0n1p6 /mnt
+             btrfs filesystem resize -32M /mnt
+             umount /mnt
+             cryptsetup reencrypt --encrypt --reduce-device-size 32M /dev/nvme0n1p6
+
+          5. OPEN the encrypted partition:
+             cryptsetup open /dev/nvme0n1p6 fedora-root
+
+          6. RUN the boot configuration playbook:
+             cd /root/ansible-luks-encrypt
+             ansible-playbook setup-encrypted-boot.yml
+
+          7. REBOOT and enter your LUKS passphrase at boot
+
+          ================================================================

@@ -24,29 +24,6 @@ Two playbooks handle separate phases of the encryption process:
 
 Run from your live Fedora system.
 
-**Finding your USB device:**
-
-Plug in your USB drive, then identify it:
-
-```bash
-lsblk -d -o NAME,SIZE,MODEL,TRAN
-```
-
-Look for the `usb` transport entry. Example output:
-
-```
-NAME      SIZE MODEL                    TRAN
-nvme0n1 233.8G APPLE SSD AP0256Q        nvme    <-- internal drive, DO NOT use
-sda      28.7G USB Flash Drive          usb     <-- this is your USB
-```
-
-The playbook has safety checks that will block you from accidentally selecting:
-- NVMe devices (your internal drive)
-- Non-USB transport devices (SATA, etc.)
-- Suspiciously large devices (>256GB)
-
-It also shows the device details and requires you to type `yes` before erasing.
-
 **Run the playbook:**
 
 ```bash
@@ -64,6 +41,33 @@ You can also specify the device explicitly to skip detection:
 ```bash
 ansible-playbook prepare-usb.yml -e usb_device=/dev/sda --ask-become-pass
 ```
+
+**Finding your USB device manually:**
+
+If you need to identify the device yourself, plug in your USB drive and run:
+
+```bash
+lsblk -d -p -o NAME,SIZE,MODEL,TRAN
+```
+
+On Apple Silicon, you'll see multiple NVMe devices (internal drive partitions) and your
+USB drive. Look for the `usb` transport entry:
+
+```
+NAME           SIZE MODEL             TRAN
+/dev/zram0       8G
+/dev/nvme0n1 931.8G APPLE SSD AP1024R nvme    <-- internal drive, DO NOT use
+/dev/nvme0n2     3M APPLE SSD AP1024R nvme    <-- Apple firmware, DO NOT use
+/dev/nvme0n3   128M APPLE SSD AP1024R nvme    <-- Apple firmware, DO NOT use
+/dev/sda      28.7G USB Flash Drive   usb     <-- this is your USB
+```
+
+The playbook has safety checks that will block you from accidentally selecting:
+- NVMe devices (internal drive and Apple firmware partitions)
+- Non-USB transport devices
+- Suspiciously large devices (>256GB)
+
+It also shows the device details and requires you to type `yes` before erasing.
 
 The playbook will:
 - Install build dependencies

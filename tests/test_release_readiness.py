@@ -563,6 +563,12 @@ class PublicReleaseTests(unittest.TestCase):
             with self.subTest(package=match.group(0)):
                 self.assertIn("--hash=sha256:", requirements[match.start() : end])
         workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+        portable_runner = (
+            "runs-on: ${{ github.server_url == 'https://github.com' "
+            "&& 'ubuntu-24.04' || 'review-isolated' }}"
+        )
+        self.assertIn(portable_runner, workflow)
+        self.assertNotIn("\n    runs-on: ubuntu-24.04\n", workflow)
         self.assertIn("permissions:\n  contents: read", workflow)
         self.assertIn("pull_request:", workflow)
         self.assertNotIn("pull_request_target", workflow)

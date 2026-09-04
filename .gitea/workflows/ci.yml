@@ -30,8 +30,8 @@ jobs:
           import ssl
           import sys
 
-          if sys.version_info[:2] != (3, 11):
-              raise SystemExit(f"expected Python 3.11, found {sys.version}")
+          if sys.version_info[:2] not in {(3, 11), (3, 12)}:
+              raise SystemExit(f"expected Python 3.11 or 3.12, found {sys.version}")
           ca_file = ssl.get_default_verify_paths().cafile
           if not ca_file or not pathlib.Path(ca_file).is_file():
               raise SystemExit("missing required CA certificate bundle")

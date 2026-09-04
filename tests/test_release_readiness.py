@@ -585,6 +585,7 @@ class PublicReleaseTests(unittest.TestCase):
             encoding="utf-8"
         )
         self.assertIn("\n    runs-on: review-isolated\n", gitea_workflow)
+        self.assertIn("sys.version_info[:2] not in {(3, 11), (3, 12)}", gitea_workflow)
         self.assertIn("permissions:\n  contents: read", gitea_workflow)
         self.assertIn("pull_request:", gitea_workflow)
         self.assertNotIn("pull_request_target", gitea_workflow)

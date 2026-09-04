@@ -660,6 +660,7 @@ class PublicReleaseTests(unittest.TestCase):
             bootstrap_workflow,
         )
         self.assertIn("--require-hashes", bootstrap_workflow)
+        self.assertIn("--link-mode copy", bootstrap_workflow)
         self.assertIn(
             ".venv/bin/python -m unittest discover -s tests -v",
             bootstrap_workflow,

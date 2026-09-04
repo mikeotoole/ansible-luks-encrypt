@@ -1,0 +1,118 @@
+# Gitea CI runs untrusted project code only after an exact-head checkout
+# in the isolated runner boundary. GitHub uses .github/workflows/ci.yml.
+name: CI
+
+"on":
+  push:
+    branches:
+      - main
+  pull_request_target:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: review-isolated
+    timeout-minutes: 15
+    steps:
+      - name: Prepare isolated Python test toolchain
+        run: |
+          set -euo pipefail
+          for tool in bash git python3 timeout; do
+            command -v "$tool" >/dev/null || {
+              printf 'missing required tool: %s\n' "$tool" >&2
+              exit 1
+            }
+          done
+          python3 - <<'PY'
+          import pathlib
+          import ssl
+          import sys
+
+          if sys.version_info[:2] not in {(3, 11), (3, 12)}:
+              raise SystemExit(f"expected Python 3.11 or 3.12, found {sys.version}")
+          ca_file = ssl.get_default_verify_paths().cafile
+          if not ca_file or not pathlib.Path(ca_file).is_file():
+              raise SystemExit("missing required CA certificate bundle")
+          PY
+
+      - name: Prepare exact-head checkout
+        env:
+          GITEA_TOKEN: ${{ secrets.REVIEWER_BOT_TOKEN }}
+          REPO: ${{ github.repository }}
+          TARGET: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+            printf 'invalid repository identifier\n' >&2
+            exit 1
+          fi
+          if ! [[ "$TARGET" =~ ^[0-9a-f]{40}$ ]]; then
+            printf 'invalid target commit\n' >&2
+            exit 1
+          fi
+          RUN_ROOT="/tmp/ansible-luks-ci-${TARGET}"
+          rm -rf "$RUN_ROOT"
+          mkdir -p "$RUN_ROOT"
+          git init -q "$RUN_ROOT/repo"
+          git -C "$RUN_ROOT/repo" remote add origin "https://git.lagoon.cloud/${REPO}.git"
+          if [ -n "${GITEA_TOKEN:-}" ]; then
+            timeout 300 git -C "$RUN_ROOT/repo" \
+              -c "http.extraHeader=Authorization: token ${GITEA_TOKEN}" \
+              fetch -q --depth=1 origin "$TARGET"
+          else
+            timeout 300 git -C "$RUN_ROOT/repo" fetch -q --depth=1 origin "$TARGET"
+          fi
+          test "$(git -C "$RUN_ROOT/repo" remote get-url origin)" = \
+            "https://git.lagoon.cloud/${REPO}.git"
+          git -C "$RUN_ROOT/repo" checkout -q --detach "$TARGET"
+          test "$(git -C "$RUN_ROOT/repo" rev-parse HEAD)" = "$TARGET"
+
+      - name: Install pinned verification tools without credentials
+        env:
+          TARGET: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$TARGET" =~ ^[0-9a-f]{40}$ ]]; then
+            printf 'invalid target commit\n' >&2
+            exit 1
+          fi
+          RUN_ROOT="/tmp/ansible-luks-ci-${TARGET}"
+          python3 -m venv "$RUN_ROOT/venv"
+          "$RUN_ROOT/venv/bin/python" -m pip install \
+            --disable-pip-version-check \
+            --no-cache-dir \
+            --require-hashes \
+            -r "$RUN_ROOT/repo/requirements-dev.txt"
+
+      - name: Run credential-free verification gates
+        env:
+          TARGET: ${{ github.event.pull_request.head.sha || github.sha }}
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          set -euo pipefail
+          if ! [[ "$TARGET" =~ ^[0-9a-f]{40}$ ]]; then
+            printf 'invalid target commit\n' >&2
+            exit 1
+          fi
+          RUN_ROOT="/tmp/ansible-luks-ci-${TARGET}"
+          cd "$RUN_ROOT/repo"
+          "$RUN_ROOT/venv/bin/python3" -m unittest discover -s tests -v
+          "$RUN_ROOT/venv/bin/python3" -m compileall -q scripts tests
+          "$RUN_ROOT/venv/bin/ansible-playbook" --syntax-check prepare-usb.yml
+          "$RUN_ROOT/venv/bin/ansible-playbook" --syntax-check setup-encrypted-boot.yml
+          "$RUN_ROOT/venv/bin/ansible-lint"
+          git diff --check
+          test -z "$(git status --porcelain --untracked-files=all)"
+
+      - name: Clean test workspace
+        if: ${{ always() }}
+        env:
+          TARGET: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          if ! [[ "$TARGET" =~ ^[0-9a-f]{40}$ ]]; then
+            printf 'invalid target commit\n' >&2
+            exit 1
+          fi
+          rm -rf "/tmp/ansible-luks-ci-${TARGET}"

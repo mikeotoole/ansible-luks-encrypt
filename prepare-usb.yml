@@ -1,7 +1,7 @@
 ---
 # Prepare USB Recovery Drive for Fedora Asahi LUKS Encryption
 #
-# Builds a bootable USB drive used to encrypt the internal disk.
+# WARNING: The selected USB disk is erased by the pinned upstream builder.
 #
 # Usage:
 #   ansible-playbook prepare-usb.yml --ask-become-pass
@@ -15,150 +15,128 @@
   gather_facts: false
 
   tasks:
-    # --- Detect USB device ---
-    - name: Scan for USB block devices
-      ansible.builtin.shell:
-        cmd: "lsblk -d -n -p -o NAME,SIZE,MODEL,TRAN | grep ' usb$'"
-      register: usb_scan
-      changed_when: false
-      failed_when: false
-      when: usb_device is not defined
-
     - name: List all block devices
-      ansible.builtin.shell:
-        cmd: "lsblk -d -p -o NAME,SIZE,MODEL,TRAN"
+      ansible.builtin.command:
+        argv:
+          - lsblk
+          - --paths
+          - --output
+          - NAME,SIZE,TYPE,MODEL,TRAN,MOUNTPOINTS
       register: all_devices
       changed_when: false
 
-    - name: Fail if no USB devices found
+    - name: Scan whole-disk USB candidates as JSON
+      ansible.builtin.command:
+        argv:
+          - lsblk
+          - --json
+          - --bytes
+          - --paths
+          - --nodeps
+          - --output
+          - PATH,TYPE,TRAN,SIZE,MODEL,SERIAL
+      register: usb_scan
+      changed_when: false
+      when: usb_device is not defined or usb_device | length == 0
+
+    - name: Record whole-disk USB candidates
+      ansible.builtin.set_fact:
+        usb_candidates: >-
+          {{
+            (usb_scan.stdout | from_json).blockdevices
+            | selectattr('type', 'equalto', 'disk')
+            | selectattr('tran', 'equalto', 'usb')
+            | map(attribute='path')
+            | list
+          }}
+      when: usb_device is not defined or usb_device | length == 0
+
+    - name: Fail if no USB devices were found
       ansible.builtin.fail:
         msg: |
-          No USB devices detected. Plug in your USB drive and try again.
+          No whole-disk USB devices were detected. Plug in a USB drive and try again.
 
           {{ all_devices.stdout }}
       when:
-        - usb_device is not defined
-        - usb_scan.stdout_lines | default([]) | length == 0
+        - usb_device is not defined or usb_device | length == 0
+        - usb_candidates | default([]) | length == 0
 
-    - name: Auto-select single USB device
+    - name: Auto-select the only USB device
       ansible.builtin.set_fact:
-        usb_device: "{{ usb_scan.stdout_lines[0].split()[0] }}"
+        usb_device: "{{ usb_candidates[0] }}"
       when:
-        - usb_device is not defined
-        - usb_scan.stdout_lines | length == 1
-
-    - name: Show auto-detected device
-      ansible.builtin.debug:
-        msg: "Auto-detected USB device: {{ usb_scan.stdout_lines[0] }}"
-      when:
-        - usb_scan is not skipped
-        - usb_scan.stdout_lines | default([]) | length == 1
+        - usb_device is not defined or usb_device | length == 0
+        - usb_candidates | default([]) | length == 1
 
     - name: Prompt to choose from multiple USB devices
       ansible.builtin.pause:
         prompt: |
+          Multiple whole-disk USB devices were found:
+          {{ usb_candidates | join('\n') }}
 
-          Multiple USB devices found:
-          {{ usb_scan.stdout }}
-
-          Enter the device path to use (e.g., /dev/sda)
+          Enter the exact device path to use (for example, /dev/sda)
       register: multi_usb_choice
       when:
-        - usb_device is not defined
-        - usb_scan.stdout_lines | length > 1
+        - usb_device is not defined or usb_device | length == 0
+        - usb_candidates | default([]) | length > 1
 
-    - name: Set chosen USB device
+    - name: Record the selected USB device
       ansible.builtin.set_fact:
         usb_device: "{{ multi_usb_choice.user_input | trim }}"
       when:
         - multi_usb_choice is not skipped
         - multi_usb_choice.user_input is defined
 
-    - name: Fail if no device selected
+    - name: Fail if no device was selected
       ansible.builtin.fail:
         msg: "No USB device selected. Pass -e usb_device=/dev/sda or plug in a USB drive."
       when: usb_device is not defined or usb_device | length == 0
 
-    # --- Validate selected device ---
-    - name: Verify device exists
-      ansible.builtin.stat:
-        path: "{{ usb_device }}"
-      register: usb_check
-
-    - name: Fail if device not found
-      ansible.builtin.fail:
-        msg: |
-          {{ usb_device }} not found. Check the path and try again.
-
-          {{ all_devices.stdout }}
-      when: not usb_check.stat.exists
-
-    - name: Reject NVMe devices (internal drive)
-      ansible.builtin.fail:
-        msg: |
-          ABORTED: {{ usb_device }} is an NVMe device — that is your internal drive!
-          Specify a USB device instead (e.g., /dev/sda).
-      when: "'nvme' in usb_device"
-
-    - name: Get device transport type
-      ansible.builtin.shell:
-        cmd: "lsblk -d -n -o TRAN {{ usb_device }} 2>/dev/null"
-      register: device_tran
-      changed_when: false
-      failed_when: false
-
-    - name: Reject non-USB transport devices
-      ansible.builtin.fail:
-        msg: |
-          ABORTED: {{ usb_device }} transport is '{{ device_tran.stdout | trim }}', not 'usb'.
-          This does not appear to be a USB device.
-
-          USB devices detected:
-          {{ all_devices.stdout_lines | select('search', 'usb') | list | join('\n') | default('(none found)') }}
-      when: device_tran.stdout | trim != 'usb'
-
-    - name: Get device size
-      ansible.builtin.shell:
-        cmd: "lsblk -d -n -o SIZE {{ usb_device }}"
-      register: device_size
+    - name: Validate the selected device against live block topology
+      ansible.builtin.command:
+        argv:
+          - "{{ ansible_playbook_python }}"
+          - "{{ playbook_dir }}/scripts/device_guard.py"
+          - --device
+          - "{{ usb_device }}"
+          - --max-size-gib
+          - "{{ max_usb_size_gib | string }}"
+      register: device_guard
       changed_when: false
 
-    - name: Reject suspiciously large devices (over 256GB)
-      ansible.builtin.fail:
-        msg: |
-          ABORTED: {{ usb_device }} is {{ device_size.stdout | trim }}.
-          This seems too large for a USB drive and may be an internal disk.
-          If this really is your USB drive, reduce this check in the playbook.
-      when: >
-        device_size.stdout | trim | regex_search('[0-9.]+') | float > 256
-        and 'T' in device_size.stdout
+    - name: Record validated device details and stable identity
+      ansible.builtin.set_fact:
+        validated_device: "{{ device_guard.stdout | from_json }}"
 
-    # --- Confirm before erasing ---
-    - name: Get device details for confirmation
-      ansible.builtin.shell:
-        cmd: "lsblk -o NAME,SIZE,FSTYPE,LABEL,MOUNTPOINTS {{ usb_device }}"
+    - name: Get selected device details for confirmation
+      ansible.builtin.command:
+        argv:
+          - lsblk
+          - --paths
+          - --output
+          - NAME,SIZE,MAJ:MIN,TYPE,FSTYPE,LABEL,MODEL,SERIAL,WWN,TRAN,MOUNTPOINTS
+          - "{{ usb_device }}"
       register: device_info
       changed_when: false
 
-    - name: Confirm device — ALL DATA WILL BE ERASED
+    - name: Confirm exact device path before preparation
       ansible.builtin.pause:
         prompt: |
-
           ================================================================
-           WARNING: ALL DATA ON THIS DEVICE WILL BE ERASED
+           WARNING: THIS USB DEVICE IS THE CANDIDATE ERASE TARGET
           ================================================================
 
           {{ device_info.stdout }}
 
-          Type 'yes' to continue, anything else to abort
-      register: user_confirm
+          Stable identity: {{ validated_device.identity | to_json }}
+          Type the exact device path '{{ usb_device }}' to continue preparation
+      register: initial_confirm
 
-    - name: Abort if not confirmed
+    - name: Abort unless the exact validated device path was entered
       ansible.builtin.fail:
-        msg: "Aborted. No changes were made."
-      when: user_confirm.user_input | lower != 'yes'
+        msg: "Aborted. The exact validated device path was not confirmed; no changes were made."
+      when: initial_confirm.user_input | trim != usb_device
 
-    # --- Install build dependencies ---
     - name: Install USB build dependencies
       ansible.builtin.dnf:
         name:
@@ -175,104 +153,363 @@
           - systemd-container
         state: present
 
-    # --- Clone repo if needed ---
-    - name: Check if asahi-fedora-usb repo exists
-      ansible.builtin.stat:
-        path: "{{ asahi_usb_repo_path }}/.git"
-      register: repo_check
-
-    - name: Clone asahi-fedora-usb repository
+    - name: Check out the pinned asahi-fedora-usb object store
       ansible.builtin.git:
         repo: "{{ asahi_usb_repo_url }}"
         dest: "{{ asahi_usb_repo_path }}"
+        version: "{{ asahi_usb_repo_version }}"
+        update: true
+        force: false
       become: false
-      when: not repo_check.stat.exists
 
-    # --- Build USB drive ---
-    - name: Build USB recovery drive (this will take 15-30 minutes)
-      ansible.builtin.shell:
-        cmd: "env -u SUDO_USER ./build.sh -d {{ usb_device }}"
-        chdir: "{{ asahi_usb_repo_path }}"
-      changed_when: true
-
-    # --- Post-build: install ansible and copy playbook to USB ---
-    - name: Mount USB drive for post-install setup
-      ansible.builtin.shell:
-        cmd: "env -u SUDO_USER ./build.sh mount"
-        chdir: "{{ asahi_usb_repo_path }}"
-      changed_when: true
-
-    - name: Install ansible-core on USB image
+    - name: Read the checked-out builder commit
       ansible.builtin.command:
-        cmd: "arch-chroot {{ asahi_usb_repo_path }}/mnt_usb dnf install -y ansible-core"
-      changed_when: true
+        argv:
+          - git
+          - --no-replace-objects
+          - -C
+          - "{{ asahi_usb_repo_path }}"
+          - rev-parse
+          - HEAD
+      become: false
+      register: builder_head
+      changed_when: false
 
-    - name: Copy encryption playbook to USB image
-      ansible.builtin.shell:
-        cmd: >
-          rsync -a --exclude '.git' --exclude '*.retry'
-          {{ project_dir }}/
-          {{ asahi_usb_repo_path }}/mnt_usb/root/ansible-luks-encrypt/
-      changed_when: true
+    - name: Require the exact pinned builder commit
+      ansible.builtin.assert:
+        that:
+          - builder_head.stdout | trim == asahi_usb_repo_version
+        fail_msg: "The USB builder checkout does not match the reviewed pinned commit."
 
-    - name: Unmount USB drive
-      ansible.builtin.shell:
-        cmd: "env -u SUDO_USER ./build.sh umount"
-        chdir: "{{ asahi_usb_repo_path }}"
-      changed_when: true
+    - name: Create a fresh builder workspace
+      ansible.builtin.tempfile:
+        state: directory
+        prefix: ansible-luks-encrypt-builder.
+      become: false
+      register: builder_workspace
 
-    # --- Add USB boot entry to GRUB menu ---
-    - name: Add USB boot entry to internal GRUB menu
+    - name: Build and populate the recovery USB from an exact export
+      block:
+        - name: Create the exact builder export directory
+          ansible.builtin.file:
+            path: "{{ builder_workspace.path }}/source"
+            state: directory
+            mode: "0755"
+          become: false
+
+        - name: Export the pinned tree with git archive
+          ansible.builtin.command:
+            argv:
+              - git
+              - --no-replace-objects
+              - -C
+              - "{{ asahi_usb_repo_path }}"
+              - archive
+              - --format=tar
+              - "--output={{ builder_workspace.path }}/builder.tar"
+              - "{{ asahi_usb_repo_version }}"
+          become: false
+          changed_when: true
+
+        - name: Extract only tracked pinned builder bytes
+          ansible.builtin.unarchive:
+            src: "{{ builder_workspace.path }}/builder.tar"
+            dest: "{{ builder_workspace.path }}/source"
+            remote_src: true
+          become: false
+
+        - name: Remove the intermediate builder archive
+          ansible.builtin.file:
+            path: "{{ builder_workspace.path }}/builder.tar"
+            state: absent
+          become: false
+
+        - name: Protect the complete builder workspace from substitution
+          ansible.builtin.file:
+            path: "{{ builder_workspace.path }}"
+            owner: root
+            group: root
+            mode: a-w
+            recurse: true
+
+        - name: Verify every exported Git blob and executable mode after lockdown
+          ansible.builtin.command:
+            argv:
+              - "{{ ansible_playbook_python }}"
+              - "{{ playbook_dir }}/scripts/verify_git_export.py"
+              - --repo
+              - "{{ asahi_usb_repo_path }}"
+              - --commit
+              - "{{ asahi_usb_repo_version }}"
+              - --export
+              - "{{ builder_workspace.path }}/source"
+          changed_when: false
+
+        - name: Require the exported builder entry point
+          ansible.builtin.stat:
+            path: "{{ builder_workspace.path }}/source/build.sh"
+          register: exported_builder
+
+        - name: Require an executable regular builder script
+          ansible.builtin.assert:
+            that:
+              - exported_builder.stat.exists
+              - exported_builder.stat.isreg
+              - exported_builder.stat.executable
+            fail_msg: "The pinned tree did not export an executable build.sh."
+
+        - name: Confirm exact device path immediately before erasing
+          ansible.builtin.pause:
+            prompt: |
+              ================================================================
+               FINAL WARNING: ALL DATA ON THIS EXACT DEVICE WILL BE ERASED
+              ================================================================
+
+              {{ device_info.stdout }}
+
+              The pinned builder is ready. Type the exact device path
+              '{{ usb_device }}' again to revalidate its identity and erase it
+          register: destructive_confirm
+
+        - name: Abort unless the exact erase target was reconfirmed
+          ansible.builtin.fail:
+            msg: "Aborted at the final destructive boundary; the USB was not erased."
+          when: destructive_confirm.user_input | trim != usb_device
+
+        - name: Revalidate identity and execute the pinned builder without a gap
+          ansible.builtin.command:
+            argv:
+              - "{{ ansible_playbook_python }}"
+              - "{{ playbook_dir }}/scripts/device_guard.py"
+              - --device
+              - "{{ usb_device }}"
+              - --max-size-gib
+              - "{{ max_usb_size_gib | string }}"
+              - --expected-identity-json
+              - "{{ validated_device.identity | to_json }}"
+              - --exec
+              - env
+              - -u
+              - SUDO_USER
+              - ./build.sh
+              - -d
+              - "{{ usb_device }}"
+            chdir: "{{ builder_workspace.path }}/source"
+          changed_when: true
+
+        - name: Revalidate identity and mount the exact USB
+          ansible.builtin.command:
+            argv:
+              - "{{ ansible_playbook_python }}"
+              - "{{ playbook_dir }}/scripts/device_guard.py"
+              - --device
+              - "{{ usb_device }}"
+              - --max-size-gib
+              - "{{ max_usb_size_gib | string }}"
+              - --expected-identity-json
+              - "{{ validated_device.identity | to_json }}"
+              - --exec
+              - env
+              - -u
+              - SUDO_USER
+              - ./build.sh
+              - -d
+              - "{{ usb_device }}"
+              - mount
+            chdir: "{{ builder_workspace.path }}/source"
+          changed_when: true
+
+        - name: Verify mounted USB targets belong to the confirmed device
+          ansible.builtin.command:
+            argv:
+              - "{{ ansible_playbook_python }}"
+              - "{{ playbook_dir }}/scripts/device_guard.py"
+              - --device
+              - "{{ usb_device }}"
+              - --max-size-gib
+              - "{{ max_usb_size_gib | string }}"
+              - --expected-identity-json
+              - "{{ validated_device.identity | to_json }}"
+              - --allow-mounted
+              - --expected-mountpoint
+              - "{{ builder_workspace.path }}/source/mnt_usb"
+              - --expected-mountpoint
+              - "{{ builder_workspace.path }}/source/mnt_usb/boot"
+              - --expected-mountpoint
+              - "{{ builder_workspace.path }}/source/mnt_usb/boot/efi"
+          changed_when: false
+
+        - name: Install ansible-core on the USB image
+          ansible.builtin.command:
+            argv:
+              - arch-chroot
+              - "{{ builder_workspace.path }}/source/mnt_usb"
+              - dnf
+              - install
+              - -y
+              - ansible-core
+          changed_when: true
+
+        - name: Copy this project to the USB image
+          ansible.builtin.command:
+            argv:
+              - rsync
+              - -a
+              - --exclude
+              - .git
+              - --exclude
+              - "*.retry"
+              - "{{ project_dir }}/"
+              - "{{ builder_workspace.path }}/source/mnt_usb/root/ansible-luks-encrypt/"
+          changed_when: true
+      always:
+        - name: Unmount exported builder EFI target
+          ansible.builtin.command:
+            argv:
+              - umount
+              - --
+              - "{{ builder_workspace.path }}/source/mnt_usb/boot/efi"
+          register: builder_efi_cleanup
+          changed_when: builder_efi_cleanup.rc == 0
+          failed_when: false
+
+        - name: Unmount exported builder boot target
+          ansible.builtin.command:
+            argv:
+              - umount
+              - --
+              - "{{ builder_workspace.path }}/source/mnt_usb/boot"
+          register: builder_boot_cleanup
+          changed_when: builder_boot_cleanup.rc == 0
+          failed_when: false
+
+        - name: Unmount exported builder root target
+          ansible.builtin.command:
+            argv:
+              - umount
+              - --
+              - "{{ builder_workspace.path }}/source/mnt_usb"
+          register: builder_root_cleanup
+          changed_when: builder_root_cleanup.rc == 0
+          failed_when: false
+
+        - name: Inspect every exported builder mount target
+          ansible.builtin.command:
+            argv:
+              - findmnt
+              - --mountpoint
+              - "{{ item }}"
+          loop:
+            - "{{ builder_workspace.path }}/source/mnt_usb/boot/efi"
+            - "{{ builder_workspace.path }}/source/mnt_usb/boot"
+            - "{{ builder_workspace.path }}/source/mnt_usb"
+          register: builder_mount_residue
+          changed_when: false
+          failed_when: false
+
+        - name: Revalidate USB identity and mount state after cleanup
+          ansible.builtin.command:
+            argv:
+              - "{{ ansible_playbook_python }}"
+              - "{{ playbook_dir }}/scripts/device_guard.py"
+              - --device
+              - "{{ usb_device }}"
+              - --max-size-gib
+              - "{{ max_usb_size_gib | string }}"
+              - --expected-identity-json
+              - "{{ validated_device.identity | to_json }}"
+          register: usb_cleanup_guard
+          changed_when: false
+          failed_when: false
+
+        - name: Remove workspace only after cleanup is proven
+          ansible.builtin.file:
+            path: "{{ builder_workspace.path }}"
+            state: absent
+          register: builder_workspace_cleanup
+          failed_when: false
+          when:
+            - builder_mount_residue.results | selectattr('rc', 'equalto', 1) | list | length == 3
+            - usb_cleanup_guard.rc == 0
+
+        - name: Verify no USB mounts remain
+          ansible.builtin.assert:
+            that:
+              - builder_mount_residue.results | selectattr('rc', 'equalto', 1) | list | length == 3
+              - usb_cleanup_guard.rc == 0
+              - builder_workspace_cleanup.state | default('') == 'absent'
+            fail_msg: |
+              USB cleanup is incomplete. The builder workspace was preserved at:
+                {{ builder_workspace.path }}
+
+              Inspect with findmnt before attempting manual cleanup.
+              Device guard: {{ usb_cleanup_guard.stderr | default('not run') }}
+
+    - name: Check for an existing host GRUB configuration
+      ansible.builtin.stat:
+        path: /boot/grub2/grub.cfg
+      register: host_grub
+
+    - name: Back up the host GRUB configuration once
+      ansible.builtin.copy:
+        src: /boot/grub2/grub.cfg
+        dest: /boot/grub2/grub.cfg.ansible-luks-encrypt.bak
+        remote_src: true
+        force: false
+        mode: preserve
+      when: host_grub.stat.exists
+
+    - name: Add USB boot entry to the internal GRUB menu
       ansible.builtin.command:
-        cmd: "grub2-mkconfig -o /boot/grub2/grub.cfg"
+        argv:
+          - grub2-mkconfig
+          - -o
+          - /boot/grub2/grub.cfg
       changed_when: true
 
-    # --- Next steps ---
+    - name: Read generated host GRUB metadata
+      ansible.builtin.stat:
+        path: /boot/grub2/grub.cfg
+      register: generated_host_grub
+
+    - name: Require a nonempty generated host GRUB configuration
+      ansible.builtin.assert:
+        that:
+          - generated_host_grub.stat.exists
+          - generated_host_grub.stat.isreg
+          - generated_host_grub.stat.size | int > 0
+        fail_msg: "Host GRUB generation did not produce a nonempty regular file."
+
     - name: Display next steps
       ansible.builtin.debug:
         msg: |
-
           ================================================================
            USB RECOVERY DRIVE READY
           ================================================================
 
-          A USB boot entry has been added to your GRUB menu.
+          USB identity and cleanup were verified. A non-overwriting backup of
+          any previous host GRUB file is at:
+            /boot/grub2/grub.cfg.ansible-luks-encrypt.bak
 
           NEXT STEPS:
 
-          1. REBOOT and select the USB entry from the GRUB menu:
-             - The USB entry will appear as a /dev/sda partition
-             - Select it instead of the default Fedora entry
-             - Login as: root / fedora
+          1. Reboot manually and select the USB entry from the GRUB menu.
+             Login as root with the builder's documented recovery password.
+             Change that known password or keep the recovery environment offline.
 
-             If the GRUB menu is not visible, hold SHIFT during boot.
-
-             Alternative (U-Boot method):
-             - Reboot and press a key during the U-Boot countdown
-             - At the => prompt type:
-                 env set boot_efi_bootmgr
-                 run usb_boot
-
-          2. CONNECT TO WIFI (if needed):
+          2. Connect to Wi-Fi only if needed:
              nmcli dev wifi connect YOUR_SSID password YOUR_PASSWORD
 
-          3. IDENTIFY your root partition:
-             lsblk -f /dev/nvme0n1
-             Look for the btrfs partition (likely /dev/nvme0n1p6)
+          3. Identify the root partition:
+             lsblk -f {{ nvme_device }}
 
-          4. ENCRYPT the root partition (replace p6 if different):
-             mount /dev/nvme0n1p6 /mnt
-             btrfs filesystem resize -32M /mnt
-             umount /mnt
-             cryptsetup reencrypt --encrypt --reduce-device-size 32M /dev/nvme0n1p6
+          4. Back up data, verify the exact partition, and follow README.md's
+             manual encryption procedure.
 
-          5. OPEN the encrypted partition:
-             cryptsetup open /dev/nvme0n1p6 fedora-root
-
-          6. RUN the boot configuration playbook:
+          5. Open the encrypted partition and run:
              cd /root/ansible-luks-encrypt
              ansible-playbook setup-encrypted-boot.yml
 
-          7. REBOOT and enter your LUKS passphrase at boot
+          6. Reboot manually and enter the LUKS passphrase at boot.
 
           ================================================================

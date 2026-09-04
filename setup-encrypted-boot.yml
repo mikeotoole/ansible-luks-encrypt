@@ -1,11 +1,8 @@
 ---
-# Configure Boot for LUKS-Encrypted Root Partition
+# Configure Boot for a LUKS-Encrypted Fedora Asahi Root Partition
 #
-# Run from USB boot AFTER encrypting the root partition.
-#
-# Prerequisites (do these manually before running this playbook):
-#   cryptsetup reencrypt --encrypt --reduce-device-size 32M /dev/nvme0n1pX
-#   cryptsetup open /dev/nvme0n1pX fedora-root
+# Run from the prepared USB recovery environment only AFTER manually using
+# cryptsetup reencrypt and opening the exact encrypted root partition.
 #
 # Usage:
 #   ansible-playbook setup-encrypted-boot.yml
@@ -14,197 +11,660 @@
 - name: Configure encrypted boot
   hosts: localhost
   connection: local
+  become: true
   gather_facts: false
 
-  vars:
-    luks_name: fedora-root
-    chroot_mount: /mnt
-    nvme_device: /dev/nvme0n1
-
   tasks:
-    # --- Detect LUKS partition ---
-    - name: Detect LUKS partition on internal drive
-      ansible.builtin.shell:
-        cmd: "blkid -t TYPE=crypto_LUKS -o device {{ nvme_device }}* 2>/dev/null | head -1"
+    - name: Validate mapper name and LUKS UUID input grammar
+      ansible.builtin.assert:
+        that:
+          - luks_name is match('^[A-Za-z0-9_.+-]+$')
+          - luks_name | length <= 127
+          - nvme_device is match('^/dev/nvme[0-9]+n[0-9]+$')
+        fail_msg: "Mapper or NVMe configuration has an unsupported form."
+
+    - name: Detect all LUKS partitions
+      ansible.builtin.command:
+        argv:
+          - blkid
+          - -t
+          - TYPE=crypto_LUKS
+          - -o
+          - device
       register: detected_luks
       changed_when: false
-      failed_when: false
+      failed_when: detected_luks.rc not in [0, 2]
       when: root_partition is not defined or root_partition | length == 0
 
-    - name: Set root partition fact
+    - name: Record LUKS partitions on the configured internal NVMe disk
       ansible.builtin.set_fact:
-        root_partition: "{{ detected_luks.stdout | trim }}"
+        root_candidates: >-
+          {{
+            detected_luks.stdout_lines
+            | select('match', '^' ~ (nvme_device | regex_escape) ~ 'p[0-9]+$')
+            | list
+          }}
       when: root_partition is not defined or root_partition | length == 0
 
-    - name: Fail if no LUKS partition found
-      ansible.builtin.fail:
-        msg: |
-          No LUKS partition found on {{ nvme_device }}.
+    - name: Require exactly one auto-detected internal LUKS partition
+      ansible.builtin.assert:
+        that:
+          - root_candidates | length == 1
+        fail_msg: |
+          Expected exactly one LUKS partition on {{ nvme_device }}, but found:
+          {{ root_candidates | default([]) | join('\n') }}
 
-          Either encrypt first:
-            cryptsetup reencrypt --encrypt --reduce-device-size 32M /dev/nvme0n1pX
+          Verify the partition manually, then pass the exact path with:
+            -e root_partition={{ nvme_device }}pX
+      when: root_partition is not defined or root_partition | length == 0
 
-          Or specify manually:
-            ansible-playbook setup-encrypted-boot.yml -e root_partition=/dev/nvme0n1p6
-      when: root_partition | default('') | length == 0
+    - name: Record the auto-detected root partition
+      ansible.builtin.set_fact:
+        root_partition: "{{ root_candidates[0] }}"
+      when: root_partition is not defined or root_partition | length == 0
 
-    - name: Show detected LUKS partition
-      ansible.builtin.debug:
-        msg: "LUKS partition: {{ root_partition }}"
+    - name: Require a partition path on the configured internal NVMe disk
+      ansible.builtin.assert:
+        that:
+          - root_partition is match('^' ~ (nvme_device | regex_escape) ~ 'p[0-9]+$')
+        fail_msg: "{{ root_partition }} is not a partition on {{ nvme_device }}."
 
-    # --- Verify LUKS is open ---
-    - name: Check LUKS mapper device exists
-      ansible.builtin.stat:
-        path: "/dev/mapper/{{ luks_name }}"
-      register: luks_mapper
-
-    - name: Fail if LUKS partition is not open
-      ansible.builtin.fail:
-        msg: |
-          /dev/mapper/{{ luks_name }} not found.
-
-          Open it first:
-            cryptsetup open {{ root_partition }} {{ luks_name }}
-
-          Then re-run this playbook.
-      when: not luks_mapper.stat.exists
-
-    # --- Mount filesystems ---
-    - name: Mount root subvolume
+    - name: Inspect the selected root partition identity
       ansible.builtin.command:
-        cmd: "mount -o subvol=root /dev/mapper/{{ luks_name }} {{ chroot_mount }}"
-
-    - name: Mount home subvolume
-      ansible.builtin.command:
-        cmd: "mount -o subvol=home /dev/mapper/{{ luks_name }} {{ chroot_mount }}/home"
-
-    - name: Get boot partition from fstab
-      ansible.builtin.shell:
-        cmd: "awk '$2 == \"/boot\" && !/^#/ {print $1}' {{ chroot_mount }}/etc/fstab"
-      register: boot_source
+        argv:
+          - lsblk
+          - --json
+          - --bytes
+          - --paths
+          - --nodeps
+          - --output
+          - NAME,PATH,TYPE,PKNAME,MAJ:MIN,SIZE
+          - "{{ root_partition }}"
+      register: root_identity_cmd
       changed_when: false
 
-    - name: Get EFI partition from fstab
-      ansible.builtin.shell:
-        cmd: "awk '$2 == \"/boot/efi\" && !/^#/ {print $1}' {{ chroot_mount }}/etc/fstab"
-      register: efi_source
-      changed_when: false
+    - name: Record the selected root partition identity
+      ansible.builtin.set_fact:
+        root_identity: "{{ (root_identity_cmd.stdout | from_json).blockdevices }}"
 
-    - name: Mount boot partition
+    - name: Require a unique root partition under the admitted NVMe disk
+      ansible.builtin.assert:
+        that:
+          - root_identity | length == 1
+          - root_identity[0].path == root_partition
+          - root_identity[0].type == 'part'
+          - root_identity[0].pkname == nvme_device
+          - root_identity[0]['maj:min'] | length > 0
+        fail_msg: "The selected root does not resolve to one partition under {{ nvme_device }}."
+
+    - name: Read the selected partition's LUKS UUID
       ansible.builtin.command:
-        cmd: "mount {{ boot_source.stdout | trim }} {{ chroot_mount }}/boot"
-
-    - name: Mount EFI partition
-      ansible.builtin.command:
-        cmd: "mount {{ efi_source.stdout | trim }} {{ chroot_mount }}/boot/efi"
-
-    - name: Show partition layout
-      ansible.builtin.debug:
-        msg:
-          - "Root (LUKS): {{ root_partition }} -> /dev/mapper/{{ luks_name }} -> {{ chroot_mount }}"
-          - "Boot: {{ boot_source.stdout | trim }} -> {{ chroot_mount }}/boot"
-          - "EFI:  {{ efi_source.stdout | trim }} -> {{ chroot_mount }}/boot/efi"
-
-    # --- Get LUKS UUID ---
-    - name: Get LUKS UUID
-      ansible.builtin.command:
-        cmd: "cryptsetup luksUUID {{ root_partition }}"
+        argv:
+          - cryptsetup
+          - luksUUID
+          - "{{ root_partition }}"
       register: luks_uuid_cmd
       changed_when: false
 
-    - name: Set LUKS UUID fact
+    - name: Record the selected LUKS UUID
       ansible.builtin.set_fact:
         luks_uuid: "{{ luks_uuid_cmd.stdout | trim }}"
 
-    - name: Show LUKS UUID
-      ansible.builtin.debug:
-        msg: "LUKS UUID: {{ luks_uuid }}"
+    - name: Validate mapper name and LUKS UUID
+      ansible.builtin.assert:
+        that:
+          - luks_uuid is match('^[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$')
+        fail_msg: "cryptsetup did not return a canonical LUKS UUID."
 
-    # --- Configure crypttab ---
-    - name: Write /etc/crypttab
-      ansible.builtin.copy:
-        content: "{{ luks_name }} UUID={{ luks_uuid }} none\n"
-        dest: "{{ chroot_mount }}/etc/crypttab"
-        mode: "0600"
-
-    # --- Update GRUB ---
-    - name: Check if GRUB already has LUKS UUID
+    - name: Read the selected partition's PARTUUID
       ansible.builtin.command:
-        cmd: "grep -q 'rd.luks.uuid={{ luks_uuid }}' {{ chroot_mount }}/etc/default/grub"
-      register: grub_has_luks
+        argv:
+          - blkid
+          - -s
+          - PARTUUID
+          - -o
+          - value
+          - "{{ root_partition }}"
+      register: root_partuuid
+      changed_when: false
+
+    - name: Require a nonempty root PARTUUID
+      ansible.builtin.assert:
+        that:
+          - root_partuuid.stdout | trim | length > 0
+        fail_msg: "The selected root partition has no PARTUUID."
+
+    - name: Read the selected partition's optional label
+      ansible.builtin.command:
+        argv:
+          - blkid
+          - -s
+          - LABEL
+          - -o
+          - value
+          - "{{ root_partition }}"
+      register: root_label
       changed_when: false
       failed_when: false
 
-    - name: Add LUKS UUID to GRUB cmdline
-      ansible.builtin.lineinfile:
-        path: "{{ chroot_mount }}/etc/default/grub"
-        regexp: '^(GRUB_CMDLINE_LINUX_DEFAULT=".*)(")'
-        line: '\1 rd.luks.uuid={{ luks_uuid }}\2'
-        backrefs: true
-      when: grub_has_luks.rc != 0
+    - name: Record every supported crypttab alias for the selected device
+      ansible.builtin.set_fact:
+        crypttab_source_aliases: >-
+          {{
+            [
+              'UUID=' ~ luks_uuid,
+              '/dev/disk/by-uuid/' ~ luks_uuid,
+              root_partition,
+              'PARTUUID=' ~ (root_partuuid.stdout | trim),
+              '/dev/disk/by-partuuid/' ~ (root_partuuid.stdout | trim)
+            ]
+            + (
+              [
+                'LABEL=' ~ (root_label.stdout | trim),
+                '/dev/disk/by-label/' ~ (root_label.stdout | trim)
+              ]
+              if root_label.rc == 0 and root_label.stdout | trim | length > 0
+              else []
+            )
+          }}
 
-    # --- Configure dracut for LUKS ---
-    - name: Create dracut config directory
+    - name: Verify mapper with cryptsetup status
+      ansible.builtin.command:
+        argv:
+          - cryptsetup
+          - status
+          - "{{ luks_name }}"
+      register: luks_status
+      changed_when: false
+
+    - name: Require the open mapper to back the selected partition
+      ansible.builtin.assert:
+        that:
+          - >-
+            luks_status.stdout
+            is regex('(?m)^\s*device:\s*' ~ (root_partition | regex_escape) ~ '\s*$')
+        fail_msg: |
+          /dev/mapper/{{ luks_name }} is not backed by {{ root_partition }}.
+          Close any incorrect mapping and open the selected partition explicitly:
+            cryptsetup open {{ root_partition }} {{ luks_name }}
+
+    - name: Show the exact selected encrypted partition
+      ansible.builtin.command:
+        argv:
+          - lsblk
+          - --paths
+          - --output
+          - NAME,SIZE,MAJ:MIN,TYPE,FSTYPE,LABEL,UUID,MODEL
+          - "{{ root_partition }}"
+      register: root_device_info
+      changed_when: false
+
+    - name: Confirm the exact encrypted root partition
+      ansible.builtin.pause:
+        prompt: |
+          ================================================================
+           BOOT CONFIGURATION WILL BE MODIFIED FOR THIS LUKS PARTITION
+          ================================================================
+
+          {{ root_device_info.stdout }}
+
+          Type the exact partition path '{{ root_partition }}' to continue
+      register: root_confirm
+
+    - name: Abort unless the exact root partition was entered
+      ansible.builtin.fail:
+        msg: "Aborted. The exact encrypted root partition was not confirmed."
+      when: root_confirm.user_input | trim != root_partition
+
+    - name: Check whether the chroot mount point is already mounted
+      ansible.builtin.command:
+        argv:
+          - findmnt
+          - --mountpoint
+          - "{{ chroot_mount }}"
+      register: existing_chroot_mount
+      changed_when: false
+      failed_when: false
+
+    - name: Refuse a pre-existing chroot mount
+      ansible.builtin.assert:
+        that:
+          - existing_chroot_mount.rc == 1
+        fail_msg: |
+          {{ chroot_mount }} is already mounted. Refusing to unmount or reuse a
+          mount that this playbook does not own.
+
+    - name: Ensure the chroot mount point exists
       ansible.builtin.file:
-        path: "{{ chroot_mount }}/etc/dracut.conf.d"
+        path: "{{ chroot_mount }}"
         state: directory
         mode: "0755"
 
-    - name: Configure dracut to always include crypt module
-      ansible.builtin.copy:
-        content: 'add_dracutmodules+=" crypt "'
-        dest: "{{ chroot_mount }}/etc/dracut.conf.d/crypt.conf"
-        mode: "0644"
+    - name: Configure the mounted Fedora system
+      block:
+        - name: Mount root subvolume
+          ansible.builtin.command:
+            argv:
+              - mount
+              - -o
+              - subvol=root
+              - "/dev/mapper/{{ luks_name }}"
+              - "{{ chroot_mount }}"
+          changed_when: true
 
-    # --- Rebuild boot configuration ---
-    - name: Regenerate GRUB configuration
-      ansible.builtin.command:
-        cmd: "arch-chroot {{ chroot_mount }} grub2-mkconfig -o /boot/grub2/grub.cfg"
-      changed_when: true
+        - name: Read the target operating-system identity
+          ansible.builtin.slurp:
+            src: "{{ chroot_mount }}/etc/os-release"
+          register: target_os_release
 
-    - name: Detect all installed kernel versions
-      ansible.builtin.shell:
-        cmd: "ls {{ chroot_mount }}/lib/modules/"
-      register: kernel_versions
-      changed_when: false
+        - name: Require a Fedora target root
+          ansible.builtin.assert:
+            that:
+              - >-
+                target_os_release.content | b64decode
+                is regex('(?m)^ID=(?:fedora|"fedora")$')
+            fail_msg: "The mounted root is not identified as Fedora; refusing boot changes."
 
-    - name: Rebuild initramfs for all kernels
-      ansible.builtin.shell:
-        cmd: |
-          arch-chroot {{ chroot_mount }} /bin/bash -c 'dracut --force --add crypt --kver "{{ item }}"'
-      loop: "{{ kernel_versions.stdout_lines }}"
-      changed_when: true
+        - name: Require the target fstab
+          ansible.builtin.stat:
+            path: "{{ chroot_mount }}/etc/fstab"
+          register: target_fstab
 
-    # --- Unmount ---
-    - name: Unmount EFI
-      ansible.builtin.command:
-        cmd: "umount {{ chroot_mount }}/boot/efi"
+        - name: Refuse a target without a regular fstab
+          ansible.builtin.assert:
+            that:
+              - target_fstab.stat.exists
+              - target_fstab.stat.isreg
 
-    - name: Unmount boot
-      ansible.builtin.command:
-        cmd: "umount {{ chroot_mount }}/boot"
+        - name: Ensure nested mount points exist
+          ansible.builtin.file:
+            path: "{{ item }}"
+            state: directory
+            mode: "0755"
+          loop:
+            - "{{ chroot_mount }}/home"
+            - "{{ chroot_mount }}/boot"
+            - "{{ chroot_mount }}/boot/efi"
 
-    - name: Unmount home
-      ansible.builtin.command:
-        cmd: "umount {{ chroot_mount }}/home"
+        - name: Mount home subvolume
+          ansible.builtin.command:
+            argv:
+              - mount
+              - -o
+              - subvol=home
+              - "/dev/mapper/{{ luks_name }}"
+              - "{{ chroot_mount }}/home"
+          changed_when: true
 
-    - name: Unmount root
-      ansible.builtin.command:
-        cmd: "umount {{ chroot_mount }}"
+        - name: Read the boot source from fstab
+          ansible.builtin.command:
+            argv:
+              - awk
+              - '$2 == "/boot" && $1 !~ /^#/ {print $1}'
+              - "{{ chroot_mount }}/etc/fstab"
+          register: boot_source_cmd
+          changed_when: false
 
-    # --- Done ---
+        - name: Read the EFI source from fstab
+          ansible.builtin.command:
+            argv:
+              - awk
+              - '$2 == "/boot/efi" && $1 !~ /^#/ {print $1}'
+              - "{{ chroot_mount }}/etc/fstab"
+          register: efi_source_cmd
+          changed_when: false
+
+        - name: Require exactly one boot and EFI source
+          ansible.builtin.assert:
+            that:
+              - boot_source_cmd.stdout_lines | reject('equalto', '') | list | length == 1
+              - efi_source_cmd.stdout_lines | reject('equalto', '') | list | length == 1
+            fail_msg: "Expected exactly one /boot and one /boot/efi source in target fstab."
+
+        - name: Record boot and EFI source specifications
+          ansible.builtin.set_fact:
+            boot_source: "{{ boot_source_cmd.stdout_lines[0] | trim }}"
+            efi_source: "{{ efi_source_cmd.stdout_lines[0] | trim }}"
+
+        - name: Require supported local fstab source forms
+          ansible.builtin.assert:
+            that:
+              - item is match('^(?:/dev/|(?:UUID|LABEL|PARTUUID|PARTLABEL)=)')
+            fail_msg: "Unsupported nonlocal fstab source: {{ item }}"
+          loop:
+            - "{{ boot_source }}"
+            - "{{ efi_source }}"
+
+        - name: Enumerate every tagged fstab source
+          ansible.builtin.command:
+            argv:
+              - blkid
+              - -t
+              - "{{ item }}"
+              - -o
+              - device
+          loop:
+            - "{{ boot_source }}"
+            - "{{ efi_source }}"
+          register: fstab_tag_candidates
+          changed_when: false
+          failed_when: false
+          when: item is not match('^/dev/')
+
+        - name: Require every fstab tag to resolve uniquely
+          ansible.builtin.assert:
+            that:
+              - >-
+                item.skipped | default(false)
+                or item.stdout_lines | default([]) | reject('equalto', '') | list | length == 1
+            fail_msg: "fstab tag {{ item.item }} does not identify exactly one block device."
+          loop: "{{ fstab_tag_candidates.results }}"
+
+        - name: Resolve boot and EFI sources to block-device paths
+          ansible.builtin.command:
+            argv:
+              - findfs
+              - "{{ item }}"
+          loop:
+            - "{{ boot_source }}"
+            - "{{ efi_source }}"
+          register: resolved_fstab_sources
+          changed_when: false
+
+        - name: Canonicalize resolved boot and EFI device paths
+          ansible.builtin.command:
+            argv:
+              - readlink
+              - --canonicalize-existing
+              - --
+              - "{{ item.stdout | trim }}"
+          loop: "{{ resolved_fstab_sources.results }}"
+          register: canonical_fstab_sources
+          changed_when: false
+
+        - name: Record resolved boot and EFI devices
+          ansible.builtin.set_fact:
+            boot_device: "{{ canonical_fstab_sources.results[0].stdout | trim }}"
+            efi_device: "{{ canonical_fstab_sources.results[1].stdout | trim }}"
+
+        - name: Inspect resolved boot and EFI device identities
+          ansible.builtin.command:
+            argv:
+              - lsblk
+              - --json
+              - --bytes
+              - --paths
+              - --nodeps
+              - --output
+              - NAME,PATH,TYPE,PKNAME,MAJ:MIN,SIZE
+              - "{{ item }}"
+          loop:
+            - "{{ boot_device }}"
+            - "{{ efi_device }}"
+          register: fstab_device_identities
+          changed_when: false
+
+        - name: Record resolved boot and EFI identity objects
+          ansible.builtin.set_fact:
+            boot_identity: >-
+              {{ (fstab_device_identities.results[0].stdout | from_json).blockdevices }}
+            efi_identity: >-
+              {{ (fstab_device_identities.results[1].stdout | from_json).blockdevices }}
+
+        - name: Require unique boot and EFI partitions under the admitted disk
+          ansible.builtin.assert:
+            that:
+              - boot_identity | length == 1
+              - efi_identity | length == 1
+              - boot_identity[0].path == boot_device
+              - efi_identity[0].path == efi_device
+              - boot_identity[0].type == 'part'
+              - efi_identity[0].type == 'part'
+              - boot_identity[0].pkname == nvme_device
+              - efi_identity[0].pkname == nvme_device
+              - boot_identity[0]['maj:min'] != efi_identity[0]['maj:min']
+            fail_msg: "fstab boot/EFI sources are not two unique partitions under {{ nvme_device }}."
+
+        - name: Mount boot partition
+          ansible.builtin.command:
+            argv:
+              - mount
+              - --
+              - "{{ boot_device }}"
+              - "{{ chroot_mount }}/boot"
+          changed_when: true
+
+        - name: Mount EFI partition
+          ansible.builtin.command:
+            argv:
+              - mount
+              - --
+              - "{{ efi_device }}"
+              - "{{ chroot_mount }}/boot/efi"
+          changed_when: true
+
+        - name: Read mounted boot and EFI identities as JSON
+          ansible.builtin.command:
+            argv:
+              - findmnt
+              - --json
+              - --canonicalize
+              - --output
+              - SOURCE,TARGET
+              - --mountpoint
+              - "{{ item }}"
+          loop:
+            - "{{ chroot_mount }}/boot"
+            - "{{ chroot_mount }}/boot/efi"
+          register: mounted_fstab_sources
+          changed_when: false
+
+        - name: Record mounted boot and EFI identity objects
+          ansible.builtin.set_fact:
+            mounted_boot: >-
+              {{ (mounted_fstab_sources.results[0].stdout | from_json).filesystems }}
+            mounted_efi: >-
+              {{ (mounted_fstab_sources.results[1].stdout | from_json).filesystems }}
+
+        - name: Verify mounted boot and EFI identities
+          ansible.builtin.assert:
+            that:
+              - mounted_boot | length == 1
+              - mounted_efi | length == 1
+              - mounted_boot[0].source == boot_device
+              - mounted_efi[0].source == efi_device
+              - mounted_boot[0].target == chroot_mount ~ '/boot'
+              - mounted_efi[0].target == chroot_mount ~ '/boot/efi'
+            fail_msg: "Mounted boot/EFI identities do not match the admitted fstab partitions."
+
+        - name: Check whether crypttab already exists
+          ansible.builtin.stat:
+            path: "{{ chroot_mount }}/etc/crypttab"
+          register: crypttab_file
+
+        - name: Back up the original crypttab once
+          ansible.builtin.copy:
+            src: "{{ chroot_mount }}/etc/crypttab"
+            dest: "{{ chroot_mount }}/etc/crypttab.ansible-luks-encrypt.bak"
+            remote_src: true
+            force: false
+            mode: preserve
+          when: crypttab_file.stat.exists
+
+        - name: Back up the original GRUB defaults once
+          ansible.builtin.copy:
+            src: "{{ chroot_mount }}/etc/default/grub"
+            dest: "{{ chroot_mount }}/etc/default/grub.ansible-luks-encrypt.bak"
+            remote_src: true
+            force: false
+            mode: preserve
+
+        - name: Preserve existing crypttab entries and configure the target mapper
+          ansible.builtin.command:
+            argv:
+              - "{{ ansible_playbook_python }}"
+              - "{{ playbook_dir }}/scripts/boot_config.py"
+              - crypttab
+              - --path
+              - "{{ chroot_mount }}/etc/crypttab"
+              - --luks-uuid
+              - "{{ luks_uuid }}"
+              - --mapper-name
+              - "{{ luks_name }}"
+              - --source-alias-json
+              - "{{ crypttab_source_aliases | to_json }}"
+              - --selected-device
+              - "{{ root_partition }}"
+          register: crypttab_update
+          changed_when: (crypttab_update.stdout | from_json).changed
+
+        - name: Restrict crypttab permissions
+          ansible.builtin.file:
+            path: "{{ chroot_mount }}/etc/crypttab"
+            state: file
+            mode: "0600"
+
+        - name: Add and verify the LUKS selector in GRUB defaults
+          ansible.builtin.command:
+            argv:
+              - "{{ ansible_playbook_python }}"
+              - "{{ playbook_dir }}/scripts/boot_config.py"
+              - grub
+              - --path
+              - "{{ chroot_mount }}/etc/default/grub"
+              - --luks-uuid
+              - "{{ luks_uuid }}"
+          register: grub_update
+          changed_when: (grub_update.stdout | from_json).changed
+
+        - name: Create dracut config directory
+          ansible.builtin.file:
+            path: "{{ chroot_mount }}/etc/dracut.conf.d"
+            state: directory
+            mode: "0755"
+
+        - name: Configure dracut to include the crypt module
+          ansible.builtin.copy:
+            content: 'add_dracutmodules+=" crypt "\n'
+            dest: "{{ chroot_mount }}/etc/dracut.conf.d/crypt.conf"
+            mode: "0644"
+
+        - name: Regenerate GRUB configuration
+          ansible.builtin.command:
+            argv:
+              - arch-chroot
+              - "{{ chroot_mount }}"
+              - grub2-mkconfig
+              - -o
+              - /boot/grub2/grub.cfg
+          changed_when: true
+
+        - name: Find installed kernel versions
+          ansible.builtin.find:
+            paths: "{{ chroot_mount }}/lib/modules"
+            file_type: directory
+            recurse: false
+          register: kernel_directories
+
+        - name: Require at least one installed kernel
+          ansible.builtin.assert:
+            that:
+              - kernel_directories.matched | int > 0
+            fail_msg: "No installed kernels were found under /lib/modules."
+
+        - name: Rebuild initramfs for every installed kernel
+          ansible.builtin.command:
+            argv:
+              - arch-chroot
+              - "{{ chroot_mount }}"
+              - dracut
+              - --force
+              - --add
+              - crypt
+              - --kver
+              - "{{ item.path | basename }}"
+          loop: "{{ kernel_directories.files }}"
+          changed_when: true
+      always:
+        - name: Unmount EFI after configuration
+          ansible.builtin.command:
+            argv:
+              - umount
+              - --
+              - "{{ chroot_mount }}/boot/efi"
+          register: efi_cleanup
+          changed_when: efi_cleanup.rc == 0
+          failed_when: false
+
+        - name: Unmount boot after configuration
+          ansible.builtin.command:
+            argv:
+              - umount
+              - --
+              - "{{ chroot_mount }}/boot"
+          register: boot_cleanup
+          changed_when: boot_cleanup.rc == 0
+          failed_when: false
+
+        - name: Unmount home after configuration
+          ansible.builtin.command:
+            argv:
+              - umount
+              - --
+              - "{{ chroot_mount }}/home"
+          register: home_cleanup
+          changed_when: home_cleanup.rc == 0
+          failed_when: false
+
+        - name: Unmount root after configuration
+          ansible.builtin.command:
+            argv:
+              - umount
+              - --
+              - "{{ chroot_mount }}"
+          register: root_cleanup
+          changed_when: root_cleanup.rc == 0
+          failed_when: false
+
+        - name: Inspect every playbook-owned mount target
+          ansible.builtin.command:
+            argv:
+              - findmnt
+              - --mountpoint
+              - "{{ item }}"
+          loop:
+            - "{{ chroot_mount }}/boot/efi"
+            - "{{ chroot_mount }}/boot"
+            - "{{ chroot_mount }}/home"
+            - "{{ chroot_mount }}"
+          register: setup_mount_residue
+          changed_when: false
+          failed_when: false
+
+        - name: Verify no playbook-owned mounts remain
+          ansible.builtin.assert:
+            that:
+              - setup_mount_residue.results | selectattr('rc', 'equalto', 1) | list | length == 4
+            fail_msg: |
+              Cleanup is incomplete. Inspect these targets with findmnt before
+              attempting manual cleanup:
+                {{ chroot_mount }}/boot/efi
+                {{ chroot_mount }}/boot
+                {{ chroot_mount }}/home
+                {{ chroot_mount }}
+
     - name: Display completion message
       ansible.builtin.debug:
         msg: |
-
           ================================================================
            ENCRYPTED BOOT CONFIGURED SUCCESSFULLY
           ================================================================
 
-          Reboot now:
-            reboot
+          The configuration files were verified and all playbook-owned
+          filesystems were unmounted. Review the recovery notes in README.md,
+          then reboot manually when you are ready.
 
-          At boot you will be prompted for your LUKS passphrase.
-          Characters appear as *** as you type.
+          At boot you should be prompted for the LUKS passphrase.
+          Characters may appear as *** while you type.
 
           ================================================================

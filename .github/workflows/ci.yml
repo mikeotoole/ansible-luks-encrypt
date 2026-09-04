@@ -25,6 +25,7 @@ jobs:
         with:
           python-version: "3.11"
           cache: pip
+          cache-dependency-path: requirements-dev.txt
 
       - name: Install pinned verification tools
         run: python -m pip install --disable-pip-version-check --require-hashes -r requirements-dev.txt

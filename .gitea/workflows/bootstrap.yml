@@ -44,7 +44,11 @@ jobs:
           install -d -m 0755 "$RUNNER_TEMP/bin"
           install -m 0755 "$UV_TMP/uv-x86_64-unknown-linux-gnu/uv" \
             "$RUNNER_TEMP/bin/uv"
-          test "$("$RUNNER_TEMP/bin/uv" --version)" = 'uv 0.12.4'
+          UV_VERSION="$("$RUNNER_TEMP/bin/uv" --version)"
+          if ! [[ "$UV_VERSION" =~ ^uv\ 0\.12\.4\ \(.+\)$ ]]; then
+            printf 'unexpected uv version: %s\n' "$UV_VERSION" >&2
+            exit 1
+          fi
           printf '%s\n' "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
 
       - name: Install managed Python 3.11

@@ -655,7 +655,10 @@ class PublicReleaseTests(unittest.TestCase):
         )
         self.assertIn("uv python install 3.11", bootstrap_workflow)
         self.assertIn("uv venv --python 3.11 --no-project .venv", bootstrap_workflow)
-        self.assertIn("= 'uv 0.12.4'", bootstrap_workflow)
+        self.assertIn(
+            'if ! [[ "$UV_VERSION" =~ ^uv\ 0\.12\.4\ \(.+\)$ ]]; then',
+            bootstrap_workflow,
+        )
         self.assertIn("--require-hashes", bootstrap_workflow)
         self.assertIn(
             ".venv/bin/python -m unittest discover -s tests -v",

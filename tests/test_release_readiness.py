@@ -579,6 +579,7 @@ class PublicReleaseTests(unittest.TestCase):
             "actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1",
             github_workflow,
         )
+        self.assertIn("cache-dependency-path: requirements-dev.txt", github_workflow)
         self.assertIn("python -m unittest discover -s tests -v", github_workflow)
         self.assertIn("ansible-lint", github_workflow)
         self.assertIn("--require-hashes", github_workflow)

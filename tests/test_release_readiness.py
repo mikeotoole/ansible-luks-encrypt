@@ -646,7 +646,7 @@ class PublicReleaseTests(unittest.TestCase):
             bootstrap_workflow,
         )
         checksum_step = "sha256sum --check --status"
-        extract_step = 'tar -xzf "$UV_ARCHIVE"'
+        extract_step = 'tar --no-same-owner -xzf "$UV_ARCHIVE"'
         self.assertIn(checksum_step, bootstrap_workflow)
         self.assertIn(extract_step, bootstrap_workflow)
         self.assertLess(

@@ -38,7 +38,7 @@ jobs:
           printf '%s  %s\n' \
             'c8c60f47e6f88d18dbf6f33d7279fb1fbf7ae76631768152cf5578c3d65729b4' \
             "$UV_ARCHIVE" | sha256sum --check --status
-          tar -xzf "$UV_ARCHIVE" -C "$UV_TMP"
+          tar --no-same-owner -xzf "$UV_ARCHIVE" -C "$UV_TMP"
           test -f "$UV_TMP/uv-x86_64-unknown-linux-gnu/uv"
           test ! -L "$UV_TMP/uv-x86_64-unknown-linux-gnu/uv"
           install -d -m 0755 "$RUNNER_TEMP/bin"

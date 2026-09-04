@@ -1,7 +1,7 @@
 # Temporary trusted-branch bootstrap; remove after PR #1 lands on main.
 name: Bootstrap CI
 
-on:
+"on":
   push:
     branches:
       - chore/open-source-readiness

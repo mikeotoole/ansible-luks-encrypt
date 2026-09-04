@@ -587,6 +587,8 @@ class PublicReleaseTests(unittest.TestCase):
         gitea_workflow = (ROOT / ".gitea" / "workflows" / "ci.yml").read_text(
             encoding="utf-8"
         )
+        self.assertIn('\n"on":\n', gitea_workflow)
+        self.assertNotIn("\non:\n", gitea_workflow)
         self.assertIn("\n    runs-on: review-isolated\n", gitea_workflow)
         self.assertIn("sys.version_info[:2] not in {(3, 11), (3, 12)}", gitea_workflow)
         self.assertIn("permissions:\n  contents: read", gitea_workflow)
@@ -627,6 +629,8 @@ class PublicReleaseTests(unittest.TestCase):
             ROOT / ".gitea" / "workflows" / "bootstrap.yml"
         ).read_text(encoding="utf-8")
         self.assertIn("name: Bootstrap CI", bootstrap_workflow)
+        self.assertIn('\n"on":\n', bootstrap_workflow)
+        self.assertNotIn("\non:\n", bootstrap_workflow)
         self.assertIn(
             "branches:\n      - chore/open-source-readiness", bootstrap_workflow
         )

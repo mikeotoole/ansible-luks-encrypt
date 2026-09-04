@@ -2,7 +2,7 @@
 # in the isolated runner boundary. GitHub uses .github/workflows/ci.yml.
 name: CI
 
-on:
+"on":
   push:
     branches:
       - main

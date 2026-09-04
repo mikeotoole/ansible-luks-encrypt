@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   verify:
-    runs-on: ${{ github.server_url == 'https://github.com' && 'ubuntu-24.04' || 'review-isolated' }}
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - name: Check out the exact revision

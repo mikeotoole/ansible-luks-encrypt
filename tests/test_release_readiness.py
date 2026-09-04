@@ -522,6 +522,7 @@ class PublicReleaseTests(unittest.TestCase):
             ROOT / "SECURITY.md",
             ROOT / "CONTRIBUTING.md",
             ROOT / "requirements-dev.txt",
+            ROOT / ".gitea" / "workflows" / "ci.yml",
             ROOT / ".github" / "workflows" / "ci.yml",
         ]
         for path in required:
@@ -562,21 +563,60 @@ class PublicReleaseTests(unittest.TestCase):
             end = locked_packages[index + 1].start() if index + 1 < len(locked_packages) else len(requirements)
             with self.subTest(package=match.group(0)):
                 self.assertIn("--hash=sha256:", requirements[match.start() : end])
-        workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
-        portable_runner = (
-            "runs-on: ${{ github.server_url == 'https://github.com' "
-            "&& 'ubuntu-24.04' || 'review-isolated' }}"
+        github_workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+        self.assertIn("\n    runs-on: ubuntu-24.04\n", github_workflow)
+        self.assertNotIn("review-isolated", github_workflow)
+        self.assertIn("permissions:\n  contents: read", github_workflow)
+        self.assertIn("pull_request:", github_workflow)
+        self.assertNotIn("pull_request_target", github_workflow)
+        self.assertIn(
+            "actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09",
+            github_workflow,
         )
-        self.assertIn(portable_runner, workflow)
-        self.assertNotIn("\n    runs-on: ubuntu-24.04\n", workflow)
-        self.assertIn("permissions:\n  contents: read", workflow)
-        self.assertIn("pull_request:", workflow)
-        self.assertNotIn("pull_request_target", workflow)
-        self.assertIn("actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09", workflow)
-        self.assertIn("actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1", workflow)
-        self.assertIn("python -m unittest discover -s tests -v", workflow)
-        self.assertIn("ansible-lint", workflow)
-        self.assertIn("--require-hashes", workflow)
+        self.assertIn(
+            "actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1",
+            github_workflow,
+        )
+        self.assertIn("python -m unittest discover -s tests -v", github_workflow)
+        self.assertIn("ansible-lint", github_workflow)
+        self.assertIn("--require-hashes", github_workflow)
+
+        gitea_workflow = (ROOT / ".gitea" / "workflows" / "ci.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("\n    runs-on: review-isolated\n", gitea_workflow)
+        self.assertIn("permissions:\n  contents: read", gitea_workflow)
+        self.assertIn("pull_request:", gitea_workflow)
+        self.assertNotIn("pull_request_target", gitea_workflow)
+        self.assertNotIn("uses:", gitea_workflow)
+        self.assertIn("secrets.REVIEWER_BOT_TOKEN", gitea_workflow)
+        self.assertIn("github.event.pull_request.head.sha || github.sha", gitea_workflow)
+        self.assertIn(
+            'if ! [[ "$REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then',
+            gitea_workflow,
+        )
+        target_guard = 'if ! [[ "$TARGET" =~ ^[0-9a-f]{40}$ ]]; then'
+        self.assertEqual(gitea_workflow.count(target_guard), 4)
+        self.assertNotIn(
+            '\n          [[ "$REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]\n',
+            gitea_workflow,
+        )
+        self.assertNotIn(
+            '\n          [[ "$TARGET" =~ ^[0-9a-f]{40}$ ]]\n',
+            gitea_workflow,
+        )
+        self.assertIn(
+            'remote add origin "https://git.lagoon.cloud/${REPO}.git"',
+            gitea_workflow,
+        )
+        self.assertIn(
+            'http.extraHeader=Authorization: token ${GITEA_TOKEN}',
+            gitea_workflow,
+        )
+        self.assertNotIn("https://x:", gitea_workflow)
+        self.assertIn("-m unittest discover -s tests -v", gitea_workflow)
+        self.assertIn("ansible-lint", gitea_workflow)
+        self.assertIn("--require-hashes", gitea_workflow)
 
 
 if __name__ == "__main__":

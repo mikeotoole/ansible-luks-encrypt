@@ -523,7 +523,6 @@ class PublicReleaseTests(unittest.TestCase):
             ROOT / "CONTRIBUTING.md",
             ROOT / "requirements-dev.txt",
             ROOT / ".gitea" / "workflows" / "ci.yml",
-            ROOT / ".gitea" / "workflows" / "bootstrap.yml",
             ROOT / ".github" / "workflows" / "ci.yml",
         ]
         for path in required:
@@ -592,11 +591,32 @@ class PublicReleaseTests(unittest.TestCase):
         self.assertIn("\n    runs-on: review-isolated\n", gitea_workflow)
         self.assertIn("sys.version_info[:2] not in {(3, 11), (3, 12)}", gitea_workflow)
         self.assertIn("permissions:\n  contents: read", gitea_workflow)
-        self.assertIn("\n  push:\n    branches:\n      - main\n", gitea_workflow)
-        self.assertIn("\n  pull_request_target:\n", gitea_workflow)
-        self.assertNotIn("\n  pull_request:\n", gitea_workflow)
+        event_block = gitea_workflow.split('"on":\n', 1)[1].split(
+            "\npermissions:\n", 1
+        )[0]
+        self.assertEqual(
+            event_block,
+            "  push:\n    branches:\n      - main\n  pull_request_target:\n",
+        )
         self.assertNotIn("uses:", gitea_workflow)
-        self.assertIn("secrets.REVIEWER_BOT_TOKEN", gitea_workflow)
+        token_expression = "github.token"
+        self.assertEqual(gitea_workflow.count(token_expression), 1)
+        checkout_step = gitea_workflow.split(
+            "      - name: Prepare exact-head checkout\n", 1
+        )[1].split(
+            "      - name: Install pinned verification tools without credentials\n",
+            1,
+        )[0]
+        verification_steps = gitea_workflow.split(
+            "      - name: Install pinned verification tools without credentials\n",
+            1,
+        )[1]
+        self.assertIn(token_expression, checkout_step)
+        self.assertNotIn(token_expression, verification_steps)
+        self.assertNotIn("secrets.REVIEWER_BOT_TOKEN", gitea_workflow)
+        self.assertFalse(
+            (ROOT / ".gitea" / "workflows" / "bootstrap.yml").exists()
+        )
         self.assertIn("github.event.pull_request.head.sha || github.sha", gitea_workflow)
         self.assertIn(
             'if ! [[ "$REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then',
@@ -625,53 +645,7 @@ class PublicReleaseTests(unittest.TestCase):
         self.assertIn("ansible-lint", gitea_workflow)
         self.assertIn("--require-hashes", gitea_workflow)
 
-        bootstrap_workflow = (
-            ROOT / ".gitea" / "workflows" / "bootstrap.yml"
-        ).read_text(encoding="utf-8")
-        self.assertIn("name: Bootstrap CI", bootstrap_workflow)
-        self.assertIn('\n"on":\n', bootstrap_workflow)
-        self.assertNotIn("\non:\n", bootstrap_workflow)
-        self.assertIn(
-            "branches:\n      - chore/open-source-readiness", bootstrap_workflow
-        )
-        self.assertIn("\n    runs-on: ubuntu-latest\n", bootstrap_workflow)
-        self.assertNotIn("\n  pull_request:\n", bootstrap_workflow)
-        self.assertNotIn("\n  pull_request_target:\n", bootstrap_workflow)
-        self.assertIn("persist-credentials: false", bootstrap_workflow)
-        self.assertNotIn("actions/setup-python", bootstrap_workflow)
-        self.assertNotIn("astral-sh/setup-uv", bootstrap_workflow)
-        self.assertIn(
-            "https://github.com/astral-sh/uv/releases/download/0.12.4/"
-            "uv-x86_64-unknown-linux-gnu.tar.gz",
-            bootstrap_workflow,
-        )
-        self.assertIn(
-            "c8c60f47e6f88d18dbf6f33d7279fb1fbf7ae76631768152cf5578c3d65729b4",
-            bootstrap_workflow,
-        )
-        checksum_step = "sha256sum --check --status"
-        extract_step = 'tar --no-same-owner -xzf "$UV_ARCHIVE"'
-        self.assertIn(checksum_step, bootstrap_workflow)
-        self.assertIn(extract_step, bootstrap_workflow)
-        self.assertLess(
-            bootstrap_workflow.index(checksum_step),
-            bootstrap_workflow.index(extract_step),
-        )
-        self.assertIn("uv python install 3.11", bootstrap_workflow)
-        self.assertIn("uv venv --python 3.11 --no-project .venv", bootstrap_workflow)
-        self.assertIn(
-            'if ! [[ "$UV_VERSION" =~ ^uv\ 0\.12\.4\ \(.+\)$ ]]; then',
-            bootstrap_workflow,
-        )
-        self.assertIn("--require-hashes", bootstrap_workflow)
-        self.assertIn("--link-mode copy", bootstrap_workflow)
-        self.assertIn(
-            ".venv/bin/python -m unittest discover -s tests -v",
-            bootstrap_workflow,
-        )
-        self.assertIn(".venv/bin/python -m compileall", bootstrap_workflow)
-        self.assertEqual(bootstrap_workflow.count(".venv/bin/ansible-playbook"), 2)
-        self.assertIn(".venv/bin/ansible-lint", bootstrap_workflow)
+
 
 
 if __name__ == "__main__":

@@ -523,6 +523,7 @@ class PublicReleaseTests(unittest.TestCase):
             ROOT / "CONTRIBUTING.md",
             ROOT / "requirements-dev.txt",
             ROOT / ".gitea" / "workflows" / "ci.yml",
+            ROOT / ".gitea" / "workflows" / "bootstrap.yml",
             ROOT / ".github" / "workflows" / "ci.yml",
         ]
         for path in required:
@@ -566,6 +567,8 @@ class PublicReleaseTests(unittest.TestCase):
         github_workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
         self.assertIn("\n    runs-on: ubuntu-24.04\n", github_workflow)
         self.assertNotIn("review-isolated", github_workflow)
+        self.assertIn("github.event.pull_request.head.sha || github.sha", github_workflow)
+        self.assertIn("persist-credentials: false", github_workflow)
         self.assertIn("permissions:\n  contents: read", github_workflow)
         self.assertIn("pull_request:", github_workflow)
         self.assertNotIn("pull_request_target", github_workflow)
@@ -587,7 +590,7 @@ class PublicReleaseTests(unittest.TestCase):
         self.assertIn("\n    runs-on: review-isolated\n", gitea_workflow)
         self.assertIn("sys.version_info[:2] not in {(3, 11), (3, 12)}", gitea_workflow)
         self.assertIn("permissions:\n  contents: read", gitea_workflow)
-        self.assertIn("\n  push:\n", gitea_workflow)
+        self.assertIn("\n  push:\n    branches:\n      - main\n", gitea_workflow)
         self.assertIn("\n  pull_request_target:\n", gitea_workflow)
         self.assertNotIn("\n  pull_request:\n", gitea_workflow)
         self.assertNotIn("uses:", gitea_workflow)
@@ -619,6 +622,20 @@ class PublicReleaseTests(unittest.TestCase):
         self.assertIn("-m unittest discover -s tests -v", gitea_workflow)
         self.assertIn("ansible-lint", gitea_workflow)
         self.assertIn("--require-hashes", gitea_workflow)
+
+        bootstrap_workflow = (
+            ROOT / ".gitea" / "workflows" / "bootstrap.yml"
+        ).read_text(encoding="utf-8")
+        self.assertIn("name: Bootstrap CI", bootstrap_workflow)
+        self.assertIn(
+            "branches:\n      - chore/open-source-readiness", bootstrap_workflow
+        )
+        self.assertIn("\n    runs-on: ubuntu-latest\n", bootstrap_workflow)
+        self.assertNotIn("\n  pull_request:\n", bootstrap_workflow)
+        self.assertNotIn("\n  pull_request_target:\n", bootstrap_workflow)
+        self.assertIn("persist-credentials: false", bootstrap_workflow)
+        self.assertIn("--require-hashes", bootstrap_workflow)
+        self.assertIn("ansible-lint", bootstrap_workflow)
 
 
 if __name__ == "__main__":

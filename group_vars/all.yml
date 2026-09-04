@@ -1,6 +1,10 @@
-# Path to cloned asahi-fedora-usb repository
-asahi_usb_repo_path: /home/mikeo/Development/asahi-fedora-usb
+# Pinned upstream USB builder checkout
+asahi_usb_repo_path: "{{ lookup('env', 'HOME') }}/.local/share/asahi-fedora-usb"
 asahi_usb_repo_url: https://github.com/leifliddy/asahi-fedora-usb.git
+asahi_usb_repo_version: 575df59961e6e24dd7c6952de7d332353936af46
+
+# Maximum accepted whole-disk USB size (GiB)
+max_usb_size_gib: 256
 
 # USB device for recovery drive (pass with -e usb_device=/dev/sda)
 # usb_device: /dev/sda
@@ -14,5 +18,5 @@ luks_name: fedora-root
 # Chroot mount point (used from USB boot)
 chroot_mount: /mnt
 
-# This project directory (for copying to USB)
-project_dir: /home/mikeo/Development/ansible-luks-encrypt
+# Project directory copied to the recovery image
+project_dir: "{{ playbook_dir }}"

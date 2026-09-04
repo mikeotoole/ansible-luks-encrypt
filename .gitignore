@@ -1,0 +1,10 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# Ansible
+*.retry
+
+# Editors and macOS
+.DS_Store

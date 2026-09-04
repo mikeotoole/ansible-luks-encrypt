@@ -39,7 +39,7 @@ jobs:
 
       - name: Prepare exact-head checkout
         env:
-          GITEA_TOKEN: ${{ secrets.REVIEWER_BOT_TOKEN }}
+          GITEA_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           TARGET: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |

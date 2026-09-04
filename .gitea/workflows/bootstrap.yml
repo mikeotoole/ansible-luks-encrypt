@@ -20,25 +20,55 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
 
-      - name: Set up Python
-        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
-        with:
-          python-version: "3.11"
-          cache: pip
+      - name: Install checksum-verified uv 0.12.4
+        run: |
+          set -euo pipefail
+          for tool in curl install mktemp sha256sum tar; do
+            command -v "$tool" >/dev/null || {
+              printf 'missing required tool: %s\n' "$tool" >&2
+              exit 1
+            }
+          done
+          UV_TMP="$(mktemp -d)"
+          trap 'rm -rf "$UV_TMP"' EXIT
+          UV_ARCHIVE="$UV_TMP/uv.tar.gz"
+          curl --proto '=https' --tlsv1.2 --fail --show-error --silent --location \
+            'https://github.com/astral-sh/uv/releases/download/0.12.4/uv-x86_64-unknown-linux-gnu.tar.gz' \
+            --output "$UV_ARCHIVE"
+          printf '%s  %s\n' \
+            'c8c60f47e6f88d18dbf6f33d7279fb1fbf7ae76631768152cf5578c3d65729b4' \
+            "$UV_ARCHIVE" | sha256sum --check --status
+          tar -xzf "$UV_ARCHIVE" -C "$UV_TMP"
+          test -f "$UV_TMP/uv-x86_64-unknown-linux-gnu/uv"
+          test ! -L "$UV_TMP/uv-x86_64-unknown-linux-gnu/uv"
+          install -d -m 0755 "$RUNNER_TEMP/bin"
+          install -m 0755 "$UV_TMP/uv-x86_64-unknown-linux-gnu/uv" \
+            "$RUNNER_TEMP/bin/uv"
+          test "$("$RUNNER_TEMP/bin/uv" --version)" = 'uv 0.12.4'
+          printf '%s\n' "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - name: Install managed Python 3.11
+        run: |
+          set -euo pipefail
+          uv python install 3.11
+          uv venv --python 3.11 --no-project .venv
+          .venv/bin/python -c 'import sys; assert sys.version_info[:2] == (3, 11)'
 
       - name: Install pinned verification tools
-        run: python -m pip install --disable-pip-version-check --require-hashes -r requirements-dev.txt
+        run: >-
+          uv pip install --python .venv/bin/python --no-cache
+          --require-hashes -r requirements-dev.txt
 
       - name: Run side-effect-free regression tests
-        run: python -m unittest discover -s tests -v
+        run: .venv/bin/python -m unittest discover -s tests -v
 
       - name: Compile Python sources
-        run: python -m compileall -q scripts tests
+        run: .venv/bin/python -m compileall -q scripts tests
 
       - name: Check Ansible syntax
         run: |
-          ansible-playbook --syntax-check prepare-usb.yml
-          ansible-playbook --syntax-check setup-encrypted-boot.yml
+          .venv/bin/ansible-playbook --syntax-check prepare-usb.yml
+          .venv/bin/ansible-playbook --syntax-check setup-encrypted-boot.yml
 
       - name: Lint Ansible content
-        run: ansible-lint
+        run: .venv/bin/ansible-lint

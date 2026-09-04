@@ -634,8 +634,36 @@ class PublicReleaseTests(unittest.TestCase):
         self.assertNotIn("\n  pull_request:\n", bootstrap_workflow)
         self.assertNotIn("\n  pull_request_target:\n", bootstrap_workflow)
         self.assertIn("persist-credentials: false", bootstrap_workflow)
+        self.assertNotIn("actions/setup-python", bootstrap_workflow)
+        self.assertNotIn("astral-sh/setup-uv", bootstrap_workflow)
+        self.assertIn(
+            "https://github.com/astral-sh/uv/releases/download/0.12.4/"
+            "uv-x86_64-unknown-linux-gnu.tar.gz",
+            bootstrap_workflow,
+        )
+        self.assertIn(
+            "c8c60f47e6f88d18dbf6f33d7279fb1fbf7ae76631768152cf5578c3d65729b4",
+            bootstrap_workflow,
+        )
+        checksum_step = "sha256sum --check --status"
+        extract_step = 'tar -xzf "$UV_ARCHIVE"'
+        self.assertIn(checksum_step, bootstrap_workflow)
+        self.assertIn(extract_step, bootstrap_workflow)
+        self.assertLess(
+            bootstrap_workflow.index(checksum_step),
+            bootstrap_workflow.index(extract_step),
+        )
+        self.assertIn("uv python install 3.11", bootstrap_workflow)
+        self.assertIn("uv venv --python 3.11 --no-project .venv", bootstrap_workflow)
+        self.assertIn("= 'uv 0.12.4'", bootstrap_workflow)
         self.assertIn("--require-hashes", bootstrap_workflow)
-        self.assertIn("ansible-lint", bootstrap_workflow)
+        self.assertIn(
+            ".venv/bin/python -m unittest discover -s tests -v",
+            bootstrap_workflow,
+        )
+        self.assertIn(".venv/bin/python -m compileall", bootstrap_workflow)
+        self.assertEqual(bootstrap_workflow.count(".venv/bin/ansible-playbook"), 2)
+        self.assertIn(".venv/bin/ansible-lint", bootstrap_workflow)
 
 
 if __name__ == "__main__":
